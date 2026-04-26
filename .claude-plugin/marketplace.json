@@ -1,10 +1,10 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "claude-plugins-official",
-  "description": "Directory of popular Claude Code extensions including development tools, productivity plugins, and MCP integrations",
+  "name": "symonov-fork",
+  "description": "Personal fork of claude-plugins-official with patched telegram channel (persistent typing, inline placeholder, reply buttons, localizable strings).",
   "owner": {
-    "name": "Anthropic",
-    "email": "support@anthropic.com"
+    "name": "Serhii Symonov",
+    "email": "simmotorlp@gmail.com"
   },
   "plugins": [
     {
