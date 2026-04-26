@@ -209,6 +209,51 @@ type ChatBuffer = {
 }
 const inboundBuffers = new Map<string, ChatBuffer>()
 
+// Inline-extract text content from text-y documents the user sends as
+// attachments — code files, config, csv, json, markdown — so Claude
+// gets the body straight in the inbound notification instead of having
+// to call download_attachment first. Capped at DOC_INLINE_MAX_BYTES
+// to keep prompt size reasonable. Binary formats (pdf, docx, etc.) are
+// not handled here — Claude can still call download_attachment for them.
+const DOC_INLINE_MAX_BYTES = 256 * 1024
+const TEXT_DOC_EXTS = new Set([
+  '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonc', '.xml', '.yaml',
+  '.yml', '.toml', '.ini', '.conf', '.cfg', '.env', '.log', '.html', '.htm',
+  '.css', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.sh', '.bash', '.zsh',
+  '.py', '.rb', '.php', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.h',
+  '.cpp', '.hpp', '.cc', '.sql', '.diff', '.patch',
+])
+function isLikelyTextDoc(mime: string | undefined, name: string | undefined, size: number | undefined): boolean {
+  if (size != null && size > DOC_INLINE_MAX_BYTES) return false
+  if (mime) {
+    const m = mime.split(';')[0].trim().toLowerCase()
+    if (m.startsWith('text/')) return true
+    if (m === 'application/json' || m === 'application/xml' || m === 'application/yaml' || m === 'application/x-yaml' || m === 'application/javascript' || m === 'application/typescript' || m === 'application/x-sh') return true
+  }
+  if (name) {
+    const ext = extname(name).toLowerCase()
+    if (TEXT_DOC_EXTS.has(ext)) return true
+  }
+  return false
+}
+async function extractDocumentText(file_id: string): Promise<string | null> {
+  try {
+    const file = await bot.api.getFile(file_id)
+    if (!file.file_path) return null
+    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`)
+    if (!res.ok) return null
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (buf.length > DOC_INLINE_MAX_BYTES) return null
+    // Reject likely-binary content (NUL bytes in first 4KB) — the file might
+    // have a misleading text-ish extension but actually be binary.
+    const sample = buf.subarray(0, 4096)
+    for (let i = 0; i < sample.length; i++) if (sample[i] === 0) return null
+    return buf.toString('utf8')
+  } catch {
+    return null
+  }
+}
+
 // Voice transcription via Groq Whisper. Off-default; opt-in through
 // access.voice.enabled. Bounded by a 30s timeout so a slow API can't wedge
 // the inbound flow — falls back to passing the raw attachment through.
@@ -1138,7 +1183,16 @@ bot.on('message:photo', async ctx => {
 bot.on('message:document', async ctx => {
   const doc = ctx.message.document
   const name = safeName(doc.file_name)
-  const text = ctx.message.caption ?? `(document: ${name ?? 'file'})`
+  const caption = ctx.message.caption ?? ''
+  let text = caption || `(document: ${name ?? 'file'})`
+  if (isLikelyTextDoc(doc.mime_type, name, doc.file_size)) {
+    const extracted = await extractDocumentText(doc.file_id)
+    if (extracted) {
+      const fence = '```'
+      const captionLine = caption ? caption + '\n\n' : ''
+      text = `${captionLine}${fence} ${name ?? 'document'}\n${extracted}\n${fence}`
+    }
+  }
   await handleInbound(ctx, text, undefined, {
     kind: 'document',
     file_id: doc.file_id,
