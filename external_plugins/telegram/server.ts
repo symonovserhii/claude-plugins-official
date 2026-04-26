@@ -124,6 +124,51 @@ const PROGRESS_TICK_MS = 6000
 // pins this to "claude". If tmux isn't available or the session is
 // renamed, status scraping silently falls back to the static placeholder.
 const CLAUDE_TMUX_SESSION = process.env.TELEGRAM_CLAUDE_TMUX_SESSION ?? 'claude'
+// Inbound watchdog. Set when we deliver a notification to Claude;
+// cancelled by any reply/edit_message/react in the same chat. If it
+// fires and tmux confirms Claude really is idle (no ✻/✽ thinking
+// glyphs), nudge the user that something dropped on the floor — most
+// often Claude finished tool use but forgot to call the reply tool.
+const WATCHDOG_TIMEOUT_MS = 5 * 60 * 1000
+const inboundWatchdogs = new Map<string, ReturnType<typeof setTimeout>>()
+function cancelWatchdog(chat_id: string) {
+  const t = inboundWatchdogs.get(chat_id)
+  if (t) {
+    clearTimeout(t)
+    inboundWatchdogs.delete(chat_id)
+  }
+}
+function armWatchdog(chat_id: string) {
+  cancelWatchdog(chat_id)
+  const timer = setTimeout(async () => {
+    inboundWatchdogs.delete(chat_id)
+    let stillThinking = false
+    try {
+      const { stdout } = await execFileAsync(
+        'tmux',
+        ['capture-pane', '-t', CLAUDE_TMUX_SESSION, '-p', '-S', '-10'],
+        { timeout: 1500 },
+      )
+      stillThinking = /[✻✽✺✶]\s+\w+/.test(stdout)
+    } catch {
+      // tmux unavailable — fall through to firing the warning rather than
+      // suppressing it, since we can't confirm Claude is busy.
+    }
+    if (stillThinking) {
+      // Genuinely working — give another window.
+      armWatchdog(chat_id)
+      return
+    }
+    void bot.api
+      .sendMessage(
+        chat_id,
+        '⚠️ За 5 минут от Claude не пришло ни одного ответа. Возможно, он завершил работу инструментами, но забыл вызвать reply. Попробуй повторить запрос или напиши «отправь результат предыдущей команды».',
+      )
+      .catch(() => {})
+  }, WATCHDOG_TIMEOUT_MS)
+  inboundWatchdogs.set(chat_id, timer)
+}
+
 async function readClaudeStatus(): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
@@ -823,7 +868,7 @@ const mcp = new Server(
       '',
       'CRITICAL: every <channel> inbound MUST be answered with exactly one reply tool call before you go idle, even if the underlying task failed, returned no useful data, or you only have a short status to share. Running a Bash, Read, or Skill tool and seeing the output is NOT a reply — the user only sees what reply sends. If a command fails, reply with the error. If a skill returns nothing, reply saying so. Never end a turn with an unreplied channel inbound.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. Screenshots commonly contain code, error messages, or UI text — extract the relevant text in your reply unless the user asked otherwise. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments and an optional buttons param (2D array of {text, payload}) for inline action buttons. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings. When the user taps an inline button you receive a regular channel notification with meta.event="button_press" and meta.payload set to that button\'s payload.',
       '',
@@ -1004,6 +1049,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
         stopTyping(chat_id)
+        cancelWatchdog(chat_id)
 
         // If we sent a placeholder on inbound, edit it with the first chunk
         // instead of sending a new message. Skip when files are attached
@@ -1129,6 +1175,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // and, if Claude is editing OUR progress placeholder, kill the
         // elapsed-time ticker so it stops overwriting the new content.
         stopTyping(editChatId)
+        cancelWatchdog(editChatId)
         const progress = progressMessages.get(editChatId)
         if (progress && progress.message_id === editMsgId) {
           clearProgress(editChatId)
@@ -1638,6 +1685,7 @@ async function dispatchInbound(opts: {
   // inbound pipeline. progress_message_id is exposed in the meta so Claude
   // can call edit_message against it for interim status updates.
   const progressMessageId = await startProgress(opts.chat_id, opts.from.language_code)
+  armWatchdog(opts.chat_id)
 
   void mcp.notification({
     method: 'notifications/claude/channel',
