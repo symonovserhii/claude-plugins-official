@@ -1130,10 +1130,11 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  // Send the placeholder before the MCP notification, so by the time Claude
-  // starts working there is already a visible message in the chat. progress_message_id
-  // is exposed in the meta so Claude can call edit_message for interim status updates.
-  const progressMessageId = await startProgress(chat_id, from.language_code)
+  // Placeholder posting disabled: user prefers only the typing indicator,
+  // no extra message in chat. Helpers (startProgress/clearProgress, the
+  // reply-time edit path) stay in the file but become no-ops when nothing
+  // is registered in progressMessages.
+  const progressMessageId: number | undefined = undefined
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
