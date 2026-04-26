@@ -139,6 +139,43 @@ function pickPlaceholder(setting: string | Record<string, string> | undefined, l
   }
   return DEFAULT_PROGRESS_PLACEHOLDER
 }
+// Voice transcription via Groq Whisper. Off-default; opt-in through
+// access.voice.enabled. Bounded by a 30s timeout so a slow API can't wedge
+// the inbound flow — falls back to passing the raw attachment through.
+const GROQ_KEY = process.env.TELEGRAM_GROQ_KEY
+const GROQ_TRANSCRIBE_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
+const TRANSCRIBE_TIMEOUT_MS = 30000
+async function transcribeVoice(file_id: string, language?: string): Promise<string | null> {
+  if (!GROQ_KEY) return null
+  const ac = new AbortController()
+  const t = setTimeout(() => ac.abort(), TRANSCRIBE_TIMEOUT_MS)
+  try {
+    const file = await bot.api.getFile(file_id)
+    if (!file.file_path) return null
+    const dlRes = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`, { signal: ac.signal })
+    if (!dlRes.ok) return null
+    const buf = Buffer.from(await dlRes.arrayBuffer())
+    const fd = new FormData()
+    fd.append('file', new Blob([buf], { type: 'audio/ogg' }), 'audio.ogg')
+    fd.append('model', 'whisper-large-v3')
+    if (language && language !== 'auto') fd.append('language', language)
+    fd.append('response_format', 'text')
+    const res = await fetch(GROQ_TRANSCRIBE_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${GROQ_KEY}` },
+      body: fd,
+      signal: ac.signal,
+    })
+    if (!res.ok) return null
+    const text = (await res.text()).trim()
+    return text || null
+  } catch {
+    return null
+  } finally {
+    clearTimeout(t)
+  }
+}
+
 async function startProgress(chat_id: string | number, language_code?: string): Promise<number | undefined> {
   clearProgress(chat_id)
   try {
@@ -195,6 +232,18 @@ type Access = {
    * to the built-in DEFAULT_PROGRESS_PLACEHOLDER.
    */
   progressPlaceholder?: string | Record<string, string>
+  /**
+   * Voice-message transcription via Groq Whisper. Off by default — voice
+   * arrives as an attachment (file_id) and Claude has to download + listen.
+   * When enabled, the plugin transcribes before forwarding so Claude sees
+   * the text directly. Requires TELEGRAM_GROQ_KEY in the channel .env.
+   */
+  voice?: {
+    /** Master switch. Default: false. */
+    enabled?: boolean
+    /** ISO 639-1 hint ('uk', 'ru', 'en') or 'auto' for detection. Default: 'auto'. */
+    language?: string
+  }
 }
 
 function defaultAccess(): Access {
@@ -240,6 +289,7 @@ function readAccessFile(): Access {
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
       progressPlaceholder: parsed.progressPlaceholder,
+      voice: parsed.voice,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -1008,7 +1058,12 @@ bot.on('message:document', async ctx => {
 
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
-  const text = ctx.message.caption ?? '(voice message)'
+  const access = loadAccess()
+  let text = ctx.message.caption ?? '(voice message)'
+  if (access.voice?.enabled) {
+    const transcript = await transcribeVoice(voice.file_id, access.voice.language)
+    if (transcript) text = `🎤 ${transcript}`
+  }
   await handleInbound(ctx, text, undefined, {
     kind: 'voice',
     file_id: voice.file_id,

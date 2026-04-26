@@ -121,6 +121,14 @@ Validate types:
   `default` key. The plugin picks based on the sender's profile
   language and falls back to `default` then to the built-in `⏳ ...`.
   Example: `{"uk": "⏳ Думаю...", "en": "⏳ Thinking...", "default": "⏳ ..."}`.
+- `voice`: object `{enabled, language}` for Whisper transcription of
+  voice messages. Off by default. When `enabled: true` and
+  `TELEGRAM_GROQ_KEY` is set in the channel `.env`, voice messages are
+  transcribed via Groq before reaching Claude (text shows as `🎤 ...`).
+  `language` is an ISO 639-1 hint (`"uk"`, `"ru"`, `"en"`) or `"auto"`
+  (default) for Whisper auto-detection. Audio leaves the host going to
+  Groq — do not enable for sensitive content without reviewing their
+  privacy policy first.
 
 Read, set the key, write, confirm.
 
