@@ -96,7 +96,7 @@ function startTyping(chat_id: string | number) {
   const interval = setInterval(() => {
     void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
   }, 4000)
-  const timeout = setTimeout(() => stopTyping(chat_id), 10 * 60 * 1000)
+  const timeout = setTimeout(() => stopTyping(chat_id), 5 * 60 * 1000)
   typingTickers.set(chat_id, { interval, timeout })
 }
 function stopTyping(chat_id: string | number) {
@@ -1056,11 +1056,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
+        const editChatId = args.chat_id as string
+        const editMsgId = Number(args.message_id)
+        // Claude is actively producing output — stop the typing indicator
+        // and, if Claude is editing OUR progress placeholder, kill the
+        // elapsed-time ticker so it stops overwriting the new content.
+        stopTyping(editChatId)
+        const progress = progressMessages.get(editChatId)
+        if (progress && progress.message_id === editMsgId) {
+          clearProgress(editChatId)
+        }
         const editFormat = (args.format as string | undefined) ?? 'text'
         const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
         const edited = await bot.api.editMessageText(
-          args.chat_id as string,
-          Number(args.message_id),
+          editChatId,
+          editMsgId,
           args.text as string,
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
