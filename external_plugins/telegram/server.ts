@@ -1154,6 +1154,28 @@ async function handleInbound(
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
 
+  // Enrich text with reply/forward context. Telegram delivers the original
+  // message body for replies and an origin descriptor for forwards; without
+  // this Claude only sees the new text and loses the thread.
+  const replyTo = ctx.message?.reply_to_message
+  if (replyTo) {
+    const orig = (replyTo as { text?: string; caption?: string }).text
+      ?? (replyTo as { text?: string; caption?: string }).caption
+      ?? '(non-text)'
+    const excerpt = orig.length > 240 ? orig.slice(0, 240) + '…' : orig
+    text = `[↩ replying to: "${excerpt}"]\n${text}`
+  }
+  const fwd = (ctx.message as { forward_origin?: { type: string; sender_user?: { username?: string; first_name?: string }; sender_chat?: { title?: string }; chat?: { title?: string }; sender_user_name?: string; date?: number } }).forward_origin
+  if (fwd) {
+    let source = 'unknown'
+    if (fwd.type === 'user' && fwd.sender_user) source = fwd.sender_user.username ? `@${fwd.sender_user.username}` : (fwd.sender_user.first_name ?? 'user')
+    else if (fwd.type === 'chat' && fwd.sender_chat) source = fwd.sender_chat.title ?? 'chat'
+    else if (fwd.type === 'channel' && fwd.chat) source = fwd.chat.title ?? 'channel'
+    else if (fwd.type === 'hidden_user' && fwd.sender_user_name) source = fwd.sender_user_name
+    const when = fwd.date ? new Date(fwd.date * 1000).toISOString() : ''
+    text = `[↪ forwarded from ${source}${when ? ` at ${when}` : ''}]\n${text}`
+  }
+
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
   // relaying as chat. The sender is already gate()-approved at this point
