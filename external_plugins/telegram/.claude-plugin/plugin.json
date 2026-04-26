@@ -1,7 +1,7 @@
 {
   "name": "telegram",
   "description": "Telegram channel for Claude Code \u2014 messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /telegram:access.",
-  "version": "0.0.6-symonov.13",
+  "version": "0.0.6-symonov.14",
   "keywords": [
     "telegram",
     "messaging",
