@@ -20,7 +20,7 @@ import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'gramm
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
-import { homedir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { join, extname, sep } from 'path'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -154,6 +154,45 @@ function pickPlaceholder(setting: string | Record<string, string> | undefined, l
   }
   return DEFAULT_PROGRESS_PLACEHOLDER
 }
+// Daily digest scheduler. Polls every minute and synthesizes an MCP
+// inbound notification when the wall clock matches access.morningDigest.time.
+// Survives access.json edits because it re-reads on every tick. Bot
+// restart resets the dedupe stamp; possible double-fire only if restart
+// happens within the digest minute itself.
+let lastDigestStamp = ''
+function digestTick() {
+  const access = loadAccess()
+  const cfg = access.morningDigest
+  if (!cfg?.enabled || !cfg.time) return
+  const m = /^(\d{1,2}):(\d{2})$/.exec(cfg.time.trim())
+  if (!m) return
+  const targetH = String(parseInt(m[1], 10)).padStart(2, '0')
+  const targetM = m[2]
+  const now = new Date()
+  const curStamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+  const targetStamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}-${targetH}:${targetM}`
+  if (curStamp !== targetStamp || lastDigestStamp === targetStamp) return
+  lastDigestStamp = targetStamp
+  const chat_id = cfg.chat_id ?? access.allowFrom[0]
+  if (!chat_id) return
+  const command = cfg.command ?? '/digest'
+  void mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: command,
+      meta: {
+        chat_id,
+        user: 'cron',
+        user_id: '0',
+        ts: now.toISOString(),
+        event: 'cron_trigger',
+      },
+    },
+  }).catch(() => {})
+  process.stderr.write(`telegram channel: morning digest fired at ${targetStamp} for chat ${chat_id}\n`)
+}
+setInterval(digestTick, 60_000).unref()
+
 // Discover user skills from ~/.claude/skills/<name>/SKILL.md and register
 // them as Telegram bot commands so they show up under the "/" menu in
 // chat. Telegram requires command names to match [a-z][a-z0-9_]{0,31};
@@ -372,6 +411,23 @@ type Access = {
     language?: string
   }
   /**
+   * Daily morning digest. When enabled, the plugin synthesizes a fake
+   * inbound message at the configured time so Claude runs the configured
+   * command (default '/digest') without the user typing it.
+   *
+   * Server local time. To pick a chat, the plugin uses the configured
+   * chat_id; if missing it falls back to the first allowFrom entry.
+   */
+  morningDigest?: {
+    enabled?: boolean
+    /** "HH:MM" 24h, server local time. */
+    time?: string
+    /** Target chat. Defaults to allowFrom[0]. */
+    chat_id?: string
+    /** What to send. Defaults to '/digest'. */
+    command?: string
+  }
+  /**
    * Multi-message debounce window in milliseconds. When the user sends
    * several plain-text messages in quick succession, the plugin batches
    * them and fires a single notification to Claude with all of them
@@ -427,6 +483,7 @@ function readAccessFile(): Access {
       progressPlaceholder: parsed.progressPlaceholder,
       voice: parsed.voice,
       bufferDelayMs: parsed.bufferDelayMs,
+      morningDigest: parsed.morningDigest,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -808,13 +865,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply': {
         const chat_id = args.chat_id as string
-        const text = args.text as string
+        let text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
 
         assertAllowedChat(chat_id)
+
+        // Long-reply-as-file: when the response is much bigger than a few
+        // Telegram messages, attach the full text as a .md file instead of
+        // spamming the chat with chunks. The user gets a short preview to
+        // skim plus the attachment. Disabled when the caller already
+        // attached files of their own — they own the layout in that case.
+        const LONG_REPLY_AS_FILE_THRESHOLD = 12000
+        let longReplyTmpPath: string | undefined
+        if (text.length >= LONG_REPLY_AS_FILE_THRESHOLD && files.length === 0) {
+          const tmp = join(tmpdir(), `tg-reply-${Date.now()}-${randomBytes(4).toString('hex')}.md`)
+          writeFileSync(tmp, text, { mode: 0o600 })
+          files.push(tmp)
+          longReplyTmpPath = tmp
+          const preview = text.slice(0, 600).replace(/\s+$/, '')
+          text = `${preview}\n\n…(${text.length.toLocaleString()} chars total — full reply attached)`
+        }
 
         for (const f of files) {
           assertSendable(f)
@@ -914,6 +987,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        if (longReplyTmpPath) {
+          try { rmSync(longReplyTmpPath) } catch {}
+        }
         const result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
