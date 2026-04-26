@@ -154,6 +154,19 @@ function pickPlaceholder(setting: string | Record<string, string> | undefined, l
   }
   return DEFAULT_PROGRESS_PLACEHOLDER
 }
+// Multi-message debounce buffer. When access.bufferDelayMs > 0, plain-text
+// inbounds are queued and flushed as a single concatenated notification once
+// the user stops typing for that many milliseconds. Attachment-bearing
+// messages always flush any pending buffer first then go through unbuffered.
+type BufferedItem = { text: string; msgId?: number; ts: string }
+type ChatBuffer = {
+  items: BufferedItem[]
+  flushTimer: ReturnType<typeof setTimeout>
+  ctx: Context
+  from: NonNullable<Context['from']>
+}
+const inboundBuffers = new Map<string, ChatBuffer>()
+
 // Voice transcription via Groq Whisper. Off-default; opt-in through
 // access.voice.enabled. Bounded by a 30s timeout so a slow API can't wedge
 // the inbound flow — falls back to passing the raw attachment through.
@@ -271,6 +284,15 @@ type Access = {
     /** ISO 639-1 hint ('uk', 'ru', 'en') or 'auto' for detection. Default: 'auto'. */
     language?: string
   }
+  /**
+   * Multi-message debounce window in milliseconds. When the user sends
+   * several plain-text messages in quick succession, the plugin batches
+   * them and fires a single notification to Claude with all of them
+   * concatenated. Helps when a thought is split across several short
+   * messages. Set to 0 to disable (default). Recommended: 2500-4000.
+   * Messages with attachments or images bypass buffering entirely.
+   */
+  bufferDelayMs?: number
 }
 
 function defaultAccess(): Access {
@@ -317,6 +339,7 @@ function readAccessFile(): Access {
       chunkMode: parsed.chunkMode,
       progressPlaceholder: parsed.progressPlaceholder,
       voice: parsed.voice,
+      bufferDelayMs: parsed.bufferDelayMs,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -1241,33 +1264,92 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  // Multi-message debounce: if buffering is on AND this is plain text (no
+  // image/attachment), queue and reset the flush timer instead of firing
+  // a notification right now. The flush coalesces queued messages into one
+  // notification with the texts concatenated. Attachment-bearing messages
+  // can't be safely concatenated, so they flush any pending buffer first
+  // and then go through unbuffered.
+  const bufferDelay = access.bufferDelayMs ?? 0
+  const ts = new Date((ctx.message?.date ?? 0) * 1000).toISOString()
+  if (bufferDelay > 0 && !attachment && !imagePath) {
+    let buf = inboundBuffers.get(chat_id)
+    if (buf) {
+      clearTimeout(buf.flushTimer)
+      buf.items.push({ text, msgId, ts })
+    } else {
+      buf = { items: [{ text, msgId, ts }], flushTimer: setTimeout(() => {}, 0), ctx, from }
+      clearTimeout(buf.flushTimer)
+      inboundBuffers.set(chat_id, buf)
+    }
+    buf.flushTimer = setTimeout(() => {
+      void flushInboundBuffer(chat_id)
+    }, bufferDelay)
+    return
+  }
+  // Attachment/image bypasses buffering — but flush any pending text first
+  // so order is preserved.
+  if (inboundBuffers.has(chat_id)) {
+    await flushInboundBuffer(chat_id)
+  }
+  await dispatchInbound({ ctx, from, chat_id, text, msgId, ts, attachment, imagePath })
+}
+
+async function flushInboundBuffer(chat_id: string): Promise<void> {
+  const buf = inboundBuffers.get(chat_id)
+  if (!buf) return
+  inboundBuffers.delete(chat_id)
+  clearTimeout(buf.flushTimer)
+  const combined = buf.items.map(i => i.text).join('\n\n')
+  const last = buf.items[buf.items.length - 1]
+  await dispatchInbound({
+    ctx: buf.ctx,
+    from: buf.from,
+    chat_id,
+    text: combined,
+    msgId: last.msgId,
+    ts: last.ts,
+    bufferedCount: buf.items.length,
+  })
+}
+
+async function dispatchInbound(opts: {
+  ctx: Context
+  from: NonNullable<Context['from']>
+  chat_id: string
+  text: string
+  msgId?: number
+  ts: string
+  attachment?: AttachmentMeta
+  imagePath?: string
+  bufferedCount?: number
+}): Promise<void> {
   // Post the placeholder before the MCP notification so by the time Claude
   // starts working there is already a visible message in the chat. Bounded
   // by PROGRESS_SEND_TIMEOUT_MS so a slow Telegram API can't wedge the
   // inbound pipeline. progress_message_id is exposed in the meta so Claude
   // can call edit_message against it for interim status updates.
-  const progressMessageId = await startProgress(chat_id, from.language_code)
+  const progressMessageId = await startProgress(opts.chat_id, opts.from.language_code)
 
-  // image_path goes in meta only — an in-content "[image attached — read: PATH]"
-  // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
+  void mcp.notification({
     method: 'notifications/claude/channel',
     params: {
-      content: text,
+      content: opts.text,
       meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
+        chat_id: opts.chat_id,
+        ...(opts.msgId != null ? { message_id: String(opts.msgId) } : {}),
         ...(progressMessageId != null ? { progress_message_id: String(progressMessageId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
+        user: opts.from.username ?? String(opts.from.id),
+        user_id: String(opts.from.id),
+        ts: opts.ts,
+        ...(opts.imagePath ? { image_path: opts.imagePath } : {}),
+        ...(opts.bufferedCount && opts.bufferedCount > 1 ? { buffered_count: String(opts.bufferedCount) } : {}),
+        ...(opts.attachment ? {
+          attachment_kind: opts.attachment.kind,
+          attachment_file_id: opts.attachment.file_id,
+          ...(opts.attachment.size != null ? { attachment_size: String(opts.attachment.size) } : {}),
+          ...(opts.attachment.mime ? { attachment_mime: opts.attachment.mime } : {}),
+          ...(opts.attachment.name ? { attachment_name: opts.attachment.name } : {}),
         } : {}),
       },
     },
