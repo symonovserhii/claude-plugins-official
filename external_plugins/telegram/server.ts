@@ -449,7 +449,7 @@ const mcp = new Server(
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      'reply accepts file paths (files: ["/abs/path.png"]) for attachments and an optional buttons param (2D array of {text, payload}) for inline action buttons. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings. When the user taps an inline button you receive a regular channel notification with meta.event="button_press" and meta.payload set to that button\'s payload.',
       '',
       'Each inbound message includes a progress_message_id meta field — a placeholder ("⏳ ...") the channel already posted in chat. Use edit_message against this id for short status updates while you work ("Searching docs...", "Analyzing 3 sources..."). The first reply automatically edits this placeholder in place (no new message), so the user sees a single message that morphs from "thinking" to "answering". Files in reply, or chunked replies past the first, are sent as new messages.',
       '',
@@ -518,6 +518,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['text', 'markdownv2'],
             description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+          },
+          buttons: {
+            type: 'array',
+            description: 'Optional inline buttons attached to the last message sent. 2D array — outer = rows, inner = buttons in that row. Each button: { text: visible label, payload: opaque string ≤60 chars }. When the sender taps a button you receive a regular channel notification with meta.event="button_press" and meta.payload set to the button payload.',
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string' },
+                  payload: { type: 'string' },
+                },
+                required: ['text', 'payload'],
+              },
+            },
           },
         },
         required: ['chat_id', 'text'],
@@ -621,15 +636,35 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           clearProgress(chat_id)
         }
 
+        // Inline buttons attached to the last message of the reply (text or
+        // file, whichever comes last). callback_data is capped at 64 bytes
+        // by Telegram, so the user-supplied payload is truncated to fit
+        // after our 'usr:' prefix.
+        const buttons = (args.buttons as { text: string; payload: string }[][] | undefined) ?? []
+        let buttonMarkup: InlineKeyboard | undefined
+        if (buttons.length > 0) {
+          buttonMarkup = new InlineKeyboard()
+          for (let r = 0; r < buttons.length; r++) {
+            for (const b of buttons[r]) {
+              buttonMarkup.text(b.text, `usr:${b.payload}`.slice(0, 64))
+            }
+            if (r < buttons.length - 1) buttonMarkup.row()
+          }
+        }
+        const lastIsFile = files.length > 0
+        const lastTextChunk = chunks.length - 1
+
         try {
           for (let i = editedPlaceholder ? 1 : 0; i < chunks.length; i++) {
             const shouldReplyTo =
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
+            const attachButtons = !lastIsFile && i === lastTextChunk && buttonMarkup
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
+              ...(attachButtons ? { reply_markup: buttonMarkup } : {}),
             })
             sentIds.push(sent.message_id)
           }
@@ -642,12 +677,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
-        for (const f of files) {
+        for (let fi = 0; fi < files.length; fi++) {
+          const f = files[fi]
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+          const isLast = fi === files.length - 1
+          const opts = {
+            ...(reply_to != null && replyMode !== 'off' ? { reply_parameters: { message_id: reply_to } } : {}),
+            ...(isLast && buttonMarkup ? { reply_markup: buttonMarkup } : {}),
+          }
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
@@ -806,6 +844,39 @@ bot.command('status', async ctx => {
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+
+  // User button (set by Claude via reply.buttons). Forward as a regular
+  // channel notification with meta.event=button_press so the model can
+  // react like to any other inbound.
+  if (data.startsWith('usr:')) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const payload = data.slice(4)
+    const chatId = ctx.callbackQuery.message?.chat.id
+    const msgId = ctx.callbackQuery.message?.message_id
+    void mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `(button tap: ${payload})`,
+        meta: {
+          ...(chatId != null ? { chat_id: String(chatId) } : {}),
+          ...(msgId != null ? { message_id: String(msgId) } : {}),
+          user: ctx.from.username ?? String(ctx.from.id),
+          user_id: senderId,
+          ts: new Date().toISOString(),
+          event: 'button_press',
+          payload,
+        },
+      },
+    })
+    await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
