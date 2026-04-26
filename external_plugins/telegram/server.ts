@@ -154,6 +154,29 @@ function pickPlaceholder(setting: string | Record<string, string> | undefined, l
   }
   return DEFAULT_PROGRESS_PLACEHOLDER
 }
+// Quick-keyboard helpers — turn access.quickKeyboard config into a
+// Telegram ReplyKeyboardMarkup, and translate a tapped label back to its
+// configured command so handleInbound can dispatch as if the user typed it.
+function buildQuickKeyboard(access: Access): { keyboard: { text: string }[][]; resize_keyboard: boolean; is_persistent: boolean } | undefined {
+  const rows = access.quickKeyboard?.rows
+  if (!rows || rows.length === 0) return undefined
+  return {
+    keyboard: rows.map(row => row.map(b => ({ text: b.label }))),
+    resize_keyboard: true,
+    is_persistent: true,
+  }
+}
+function quickKeyboardCommand(access: Access, text: string): string | null {
+  const rows = access.quickKeyboard?.rows
+  if (!rows) return null
+  for (const row of rows) {
+    for (const btn of row) {
+      if (btn.label === text) return btn.command
+    }
+  }
+  return null
+}
+
 // Daily digest scheduler. Polls every minute and synthesizes an MCP
 // inbound notification when the wall clock matches access.morningDigest.time.
 // Survives access.json edits because it re-reads on every tick. Bot
@@ -411,6 +434,15 @@ type Access = {
     language?: string
   }
   /**
+   * Persistent reply-keyboard shown under the chat input. Each button has a
+   * visible label and a command (typically a slash skill) that is dispatched
+   * as if the user had typed it. Empty/missing → no keyboard. Use /kb to
+   * re-summon if the user dismisses it.
+   */
+  quickKeyboard?: {
+    rows: { label: string; command: string }[][]
+  }
+  /**
    * Daily morning digest. When enabled, the plugin synthesizes a fake
    * inbound message at the configured time so Claude runs the configured
    * command (default '/digest') without the user typing it.
@@ -484,6 +516,7 @@ function readAccessFile(): Access {
       voice: parsed.voice,
       bufferDelayMs: parsed.bufferDelayMs,
       morningDigest: parsed.morningDigest,
+      quickKeyboard: parsed.quickKeyboard,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -1091,24 +1124,42 @@ setInterval(() => {
 // the gate's behavior for unrecognized groups.
 
 bot.command('start', async ctx => {
-  if (!dmCommandGate(ctx)) return
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const keyboard = buildQuickKeyboard(gated.access)
   await ctx.reply(
     `This bot bridges Telegram to a Claude Code session.\n\n` +
     `To pair:\n` +
     `1. DM me anything — you'll get a 6-char code\n` +
     `2. In Claude Code: /telegram:access pair <code>\n\n` +
-    `After that, DMs here reach that session.`
+    `After that, DMs here reach that session.`,
+    keyboard ? { reply_markup: keyboard } : undefined,
   )
 })
 
 bot.command('help', async ctx => {
-  if (!dmCommandGate(ctx)) return
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const keyboard = buildQuickKeyboard(gated.access)
   await ctx.reply(
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
-    `/status — check your pairing state`
+    `/status — check your pairing state\n` +
+    `/kb — show the quick-action keyboard`,
+    keyboard ? { reply_markup: keyboard } : undefined,
   )
+})
+
+bot.command('kb', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const keyboard = buildQuickKeyboard(gated.access)
+  if (!keyboard) {
+    await ctx.reply('No quick keyboard configured. Set access.quickKeyboard.rows in access.json.')
+    return
+  }
+  await ctx.reply('Quick actions:', { reply_markup: keyboard })
 })
 
 bot.command('status', async ctx => {
@@ -1375,6 +1426,14 @@ async function handleInbound(
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
+
+  // Quick-keyboard label → command rewrite. The user tapped one of the
+  // persistent reply-keyboard buttons; Telegram only ships the visible
+  // label as message text. Map it back to the configured command (e.g.
+  // "🌡 Температура" → "/temp") before any further processing so Claude
+  // sees the slash form, not the label.
+  const mappedCommand = quickKeyboardCommand(access, text)
+  if (mappedCommand) text = mappedCommand
 
   // Enrich text with reply/forward context. Telegram delivers the original
   // message body for replies and an origin descriptor for forwards; without
