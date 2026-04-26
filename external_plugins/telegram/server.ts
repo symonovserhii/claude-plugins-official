@@ -116,11 +116,26 @@ function stopTyping(chat_id: string | number) {
 const DEFAULT_PROGRESS_PLACEHOLDER = '⏳ Думаю...'
 const PROGRESS_SEND_TIMEOUT_MS = 3000
 const PROGRESS_TIMEOUT_MS = 10 * 60 * 1000
-type ProgressEntry = { message_id: number; timeout: ReturnType<typeof setTimeout> }
+const PROGRESS_TICK_MS = 15000
+type ProgressEntry = {
+  message_id: number
+  baseText: string
+  startedAt: number
+  timeout: ReturnType<typeof setTimeout>
+  ticker: ReturnType<typeof setInterval>
+}
 const progressMessages = new Map<string | number, ProgressEntry>()
+function fmtElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  const rem = s % 60
+  return rem === 0 ? `${m}m` : `${m}m ${rem}s`
+}
 function clearProgress(chat_id: string | number) {
   const e = progressMessages.get(chat_id)
   if (e) {
+    clearInterval(e.ticker)
     clearTimeout(e.timeout)
     progressMessages.delete(chat_id)
   }
@@ -180,16 +195,28 @@ async function startProgress(chat_id: string | number, language_code?: string): 
   clearProgress(chat_id)
   try {
     const access = loadAccess()
-    const text = pickPlaceholder(access.progressPlaceholder, language_code)
+    const baseText = pickPlaceholder(access.progressPlaceholder, language_code)
     // Race the API call against a hard timeout so a slow Telegram response
     // never wedges the inbound flow. If the timeout wins, we fall through
     // and Claude still receives the notification, just without a placeholder.
     const sent = await Promise.race([
-      bot.api.sendMessage(chat_id, text),
+      bot.api.sendMessage(chat_id, baseText),
       new Promise<never>((_, rej) => setTimeout(() => rej(new Error('progress send timeout')), PROGRESS_SEND_TIMEOUT_MS)),
     ])
+    const startedAt = Date.now()
     const timeout = setTimeout(() => clearProgress(chat_id), PROGRESS_TIMEOUT_MS)
-    progressMessages.set(chat_id, { message_id: sent.message_id, timeout })
+    // Tick the placeholder with elapsed time so the user can see the bot is
+    // alive on long requests. Stops on reply (clearProgress) or safety
+    // timeout. Telegram returns 'message is not modified' if Claude already
+    // edit_message'd the placeholder to status text — we swallow that and
+    // let the user-supplied content win.
+    const ticker = setInterval(() => {
+      const elapsed = Date.now() - startedAt
+      void bot.api
+        .editMessageText(chat_id, sent.message_id, `${baseText} (${fmtElapsed(elapsed)})`)
+        .catch(() => {})
+    }, PROGRESS_TICK_MS)
+    progressMessages.set(chat_id, { message_id: sent.message_id, baseText, startedAt, timeout, ticker })
     return sent.message_id
   } catch {
     return undefined
