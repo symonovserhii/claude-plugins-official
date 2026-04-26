@@ -113,7 +113,7 @@ function stopTyping(chat_id: string | number) {
 // next reply edits this placeholder in place (instead of sending a new
 // message), which gives an "agent is working" → "answer" feel rather than
 // "command sent → silence → answer". Cleared by reply or by 10-min timeout.
-const PROGRESS_PLACEHOLDER = '⏳ ...'
+const DEFAULT_PROGRESS_PLACEHOLDER = '⏳ ...'
 const PROGRESS_TIMEOUT_MS = 10 * 60 * 1000
 type ProgressEntry = { message_id: number; timeout: ReturnType<typeof setTimeout> }
 const progressMessages = new Map<string | number, ProgressEntry>()
@@ -124,10 +124,26 @@ function clearProgress(chat_id: string | number) {
     progressMessages.delete(chat_id)
   }
 }
-async function startProgress(chat_id: string | number): Promise<number | undefined> {
+function pickPlaceholder(setting: string | Record<string, string> | undefined, language_code?: string): string {
+  if (typeof setting === 'string') return setting
+  if (setting && typeof setting === 'object') {
+    if (language_code && setting[language_code]) return setting[language_code]
+    if (language_code) {
+      const base = language_code.split('-')[0]
+      if (setting[base]) return setting[base]
+    }
+    if (setting.default) return setting.default
+    const first = Object.values(setting)[0]
+    if (first) return first
+  }
+  return DEFAULT_PROGRESS_PLACEHOLDER
+}
+async function startProgress(chat_id: string | number, language_code?: string): Promise<number | undefined> {
   clearProgress(chat_id)
   try {
-    const sent = await bot.api.sendMessage(chat_id, PROGRESS_PLACEHOLDER)
+    const access = loadAccess()
+    const text = pickPlaceholder(access.progressPlaceholder, language_code)
+    const sent = await bot.api.sendMessage(chat_id, text)
     const timeout = setTimeout(() => clearProgress(chat_id), PROGRESS_TIMEOUT_MS)
     progressMessages.set(chat_id, { message_id: sent.message_id, timeout })
     return sent.message_id
@@ -164,6 +180,14 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /**
+   * Placeholder text posted on every inbound, edited in place by the first
+   * reply. Single string, or a map keyed by Telegram language_code (with an
+   * optional 'default' key). When a map and the sender's language_code is
+   * missing from it, falls back to 'default', then to the first entry, then
+   * to the built-in DEFAULT_PROGRESS_PLACEHOLDER.
+   */
+  progressPlaceholder?: string | Record<string, string>
 }
 
 function defaultAccess(): Access {
@@ -208,6 +232,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      progressPlaceholder: parsed.progressPlaceholder,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -1108,7 +1133,7 @@ async function handleInbound(
   // Send the placeholder before the MCP notification, so by the time Claude
   // starts working there is already a visible message in the chat. progress_message_id
   // is exposed in the meta so Claude can call edit_message for interim status updates.
-  const progressMessageId = await startProgress(chat_id)
+  const progressMessageId = await startProgress(chat_id, from.language_code)
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
