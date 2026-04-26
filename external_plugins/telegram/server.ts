@@ -113,7 +113,8 @@ function stopTyping(chat_id: string | number) {
 // next reply edits this placeholder in place (instead of sending a new
 // message), which gives an "agent is working" → "answer" feel rather than
 // "command sent → silence → answer". Cleared by reply or by 10-min timeout.
-const DEFAULT_PROGRESS_PLACEHOLDER = '⏳ ...'
+const DEFAULT_PROGRESS_PLACEHOLDER = '⏳ Думаю...'
+const PROGRESS_SEND_TIMEOUT_MS = 3000
 const PROGRESS_TIMEOUT_MS = 10 * 60 * 1000
 type ProgressEntry = { message_id: number; timeout: ReturnType<typeof setTimeout> }
 const progressMessages = new Map<string | number, ProgressEntry>()
@@ -143,7 +144,13 @@ async function startProgress(chat_id: string | number, language_code?: string): 
   try {
     const access = loadAccess()
     const text = pickPlaceholder(access.progressPlaceholder, language_code)
-    const sent = await bot.api.sendMessage(chat_id, text)
+    // Race the API call against a hard timeout so a slow Telegram response
+    // never wedges the inbound flow. If the timeout wins, we fall through
+    // and Claude still receives the notification, just without a placeholder.
+    const sent = await Promise.race([
+      bot.api.sendMessage(chat_id, text),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('progress send timeout')), PROGRESS_SEND_TIMEOUT_MS)),
+    ])
     const timeout = setTimeout(() => clearProgress(chat_id), PROGRESS_TIMEOUT_MS)
     progressMessages.set(chat_id, { message_id: sent.message_id, timeout })
     return sent.message_id
@@ -1130,11 +1137,12 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  // Placeholder posting disabled: user prefers only the typing indicator,
-  // no extra message in chat. Helpers (startProgress/clearProgress, the
-  // reply-time edit path) stay in the file but become no-ops when nothing
-  // is registered in progressMessages.
-  const progressMessageId: number | undefined = undefined
+  // Post the placeholder before the MCP notification so by the time Claude
+  // starts working there is already a visible message in the chat. Bounded
+  // by PROGRESS_SEND_TIMEOUT_MS so a slow Telegram API can't wedge the
+  // inbound pipeline. progress_message_id is exposed in the meta so Claude
+  // can call edit_message against it for interim status updates.
+  const progressMessageId = await startProgress(chat_id, from.language_code)
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
