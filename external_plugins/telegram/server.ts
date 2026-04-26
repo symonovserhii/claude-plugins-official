@@ -22,6 +22,9 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, extname, sep } from 'path'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+const execFileAsync = promisify(execFile)
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -116,7 +119,61 @@ function stopTyping(chat_id: string | number) {
 const DEFAULT_PROGRESS_PLACEHOLDER = '⏳ Думаю...'
 const PROGRESS_SEND_TIMEOUT_MS = 3000
 const PROGRESS_TIMEOUT_MS = 10 * 60 * 1000
-const PROGRESS_TICK_MS = 15000
+const PROGRESS_TICK_MS = 6000
+// Best-effort tmux session name where Claude Code runs. Wrapper script
+// pins this to "claude". If tmux isn't available or the session is
+// renamed, status scraping silently falls back to the static placeholder.
+const CLAUDE_TMUX_SESSION = process.env.TELEGRAM_CLAUDE_TMUX_SESSION ?? 'claude'
+async function readClaudeStatus(): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'tmux',
+      ['capture-pane', '-t', CLAUDE_TMUX_SESSION, '-p', '-S', '-30'],
+      { timeout: 1500 },
+    )
+    const lines = stdout.split('\n')
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const clean = lines[i].replace(/\x1b\[[0-9;]*m/g, '').trim()
+      if (!clean) continue
+      let m: RegExpExecArray | null
+      m = /^●\s*Bash\(([^)]{1,80})/.exec(clean)
+      if (m) {
+        const cmd = m[1].replace(/[`"\\]/g, '').trim()
+        return `Bash: ${cmd.length > 50 ? cmd.slice(0, 50) + '…' : cmd}`
+      }
+      m = /^●\s*Skill\(([^)]+)\)/.exec(clean)
+      if (m) return `Скилл: /${m[1]}`
+      m = /^●\s*Read\(([^)]+)\)/.exec(clean)
+      if (m) return 'Читаю файл'
+      m = /^●\s*Edit\(/.exec(clean)
+      if (m) return 'Редактирую файл'
+      m = /^●\s*Write\(/.exec(clean)
+      if (m) return 'Пишу файл'
+      m = /^●\s*Grep\(/.exec(clean)
+      if (m) return 'Ищу в коде'
+      m = /^●\s*Glob\(/.exec(clean)
+      if (m) return 'Ищу файлы'
+      m = /^●\s*Web/.exec(clean)
+      if (m) return 'Гуглю'
+      m = /^●\s*Agent\(([^)]{1,60})/.exec(clean)
+      if (m) return `Подагент: ${m[1].trim()}`
+      m = /^●\s*Task\(/.exec(clean)
+      if (m) return 'Задача'
+      // The "*Actualizing/Worked/Crunched/Thinking" status lines from
+      // Claude's progress UI — generic "thinking" with sub-action.
+      if (/^[✻✽✺✶]\s+/.test(clean)) {
+        const sub = clean.replace(/^[✻✽✺✶]\s+/, '').replace(/\s*\(.*\)\s*$/, '').trim()
+        if (sub.toLowerCase().startsWith('worked')) return 'Думаю'
+        if (sub.toLowerCase().startsWith('crunched')) return 'Размышляю'
+        if (sub.toLowerCase().startsWith('actualizing')) return 'Подвожу итог'
+        return sub.split(/\s+/)[0] || 'Думаю'
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
 type ProgressEntry = {
   message_id: number
   baseText: string
@@ -372,11 +429,19 @@ async function startProgress(chat_id: string | number, language_code?: string): 
     // timeout. Telegram returns 'message is not modified' if Claude already
     // edit_message'd the placeholder to status text — we swallow that and
     // let the user-supplied content win.
-    const ticker = setInterval(() => {
+    let lastShownText = baseText
+    const ticker = setInterval(async () => {
       const elapsed = Date.now() - startedAt
-      void bot.api
-        .editMessageText(chat_id, sent.message_id, `${baseText} (${fmtElapsed(elapsed)})`)
-        .catch(() => {})
+      const status = await readClaudeStatus()
+      const display = status
+        ? `⏳ ${status}… (${fmtElapsed(elapsed)})`
+        : `${baseText} (${fmtElapsed(elapsed)})`
+      // Telegram returns 400 'message is not modified' if the text is the
+      // same as last edit — skip the API call to keep the rate-limit
+      // budget for genuinely new content.
+      if (display === lastShownText) return
+      lastShownText = display
+      void bot.api.editMessageText(chat_id, sent.message_id, display).catch(() => {})
     }, PROGRESS_TICK_MS)
     progressMessages.set(chat_id, { message_id: sent.message_id, baseText, startedAt, timeout, ticker })
     return sent.message_id
