@@ -154,6 +154,48 @@ function pickPlaceholder(setting: string | Record<string, string> | undefined, l
   }
   return DEFAULT_PROGRESS_PLACEHOLDER
 }
+// Discover user skills from ~/.claude/skills/<name>/SKILL.md and register
+// them as Telegram bot commands so they show up under the "/" menu in
+// chat. Telegram requires command names to match [a-z][a-z0-9_]{0,31};
+// skills with hyphens (e.g. ai-factory) are skipped — invoke those by
+// typing the slash manually. Description is taken from the YAML
+// frontmatter and truncated to 256 chars (Telegram's max).
+function loadSkillCommands(): { command: string; description: string }[] {
+  const skillsDir = join(homedir(), '.claude', 'skills')
+  let entries: string[] = []
+  try {
+    entries = readdirSync(skillsDir)
+  } catch {
+    return []
+  }
+  const out: { command: string; description: string }[] = []
+  for (const name of entries.sort()) {
+    if (!/^[a-z][a-z0-9_]{0,31}$/.test(name)) continue
+    let content: string
+    try {
+      content = readFileSync(join(skillsDir, name, 'SKILL.md'), 'utf8')
+    } catch {
+      continue
+    }
+    const fmMatch = /^---\s*\n([\s\S]*?)\n---/.exec(content)
+    if (!fmMatch) continue
+    const fm = fmMatch[1]
+    const dInline = /^description:\s*(.+)$/m.exec(fm)
+    let desc = dInline ? dInline[1].trim() : ''
+    if (desc === '|' || desc === '>' || desc === '|-' || desc === '>-') {
+      const dBlock = /^description:\s*[|>]-?\s*\n((?:  .*\n?)+)/m.exec(fm)
+      if (dBlock) desc = dBlock[1].split('\n').map(l => l.trim()).filter(Boolean).join(' ')
+    }
+    if ((desc.startsWith('"') && desc.endsWith('"')) || (desc.startsWith("'") && desc.endsWith("'"))) {
+      desc = desc.slice(1, -1)
+    }
+    if (desc.length > 256) desc = desc.slice(0, 253) + '...'
+    if (desc.length < 3) continue
+    out.push({ command: name, description: desc })
+  }
+  return out
+}
+
 // Multi-message debounce buffer. When access.bufferDelayMs > 0, plain-text
 // inbounds are queued and flushed as a single concatenated notification once
 // the user stops typing for that many milliseconds. Attachment-bearing
@@ -1377,14 +1419,17 @@ void (async () => {
           attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-          void bot.api.setMyCommands(
-            [
-              { command: 'start', description: 'Welcome and setup guide' },
-              { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
-            ],
-            { scope: { type: 'all_private_chats' } },
-          ).catch(() => {})
+          const skillCommands = loadSkillCommands()
+          const allCommands = [
+            { command: 'start', description: 'Welcome and setup guide' },
+            { command: 'help', description: 'What this bot can do' },
+            { command: 'status', description: 'Check your pairing status' },
+            ...skillCommands,
+          ].slice(0, 100) // Telegram caps at 100 commands per scope
+          void bot.api.setMyCommands(allCommands, { scope: { type: 'all_private_chats' } }).catch(() => {})
+          if (skillCommands.length > 0) {
+            process.stderr.write(`telegram channel: registered ${skillCommands.length} skill commands in bot menu\n`)
+          }
         },
       })
       return // bot.stop() was called — clean exit from the loop
