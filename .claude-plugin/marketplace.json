@@ -18,7 +18,7 @@
         "source": "git-subdir",
         "url": "https://github.com/42Crunch-AI/claude-plugins.git",
         "path": "plugins/api-security-testing",
-        "ref": "v1.0.1",
+        "ref": "v1.5.5",
         "sha": "faf5305385de8afed9468904e8639be737aff39e"
       },
       "homepage": "https://42crunch.com"
@@ -1049,8 +1049,8 @@
       "source": {
         "source": "github",
         "repo": "jfrog/claude-plugin",
-        "commit": "761921eaa12b845beba1688d699a2d45091dfe83",
-        "sha": "d80db066e219aab8190f3dc4a463b71a3a180250"
+        "commit": "259c8e718266c16e99b4f30ae9b1ed0f9f00d98d",
+        "sha": "259c8e718266c16e99b4f30ae9b1ed0f9f00d98d"
       },
       "homepage": "https://jfrog.com"
     },
@@ -1654,7 +1654,8 @@
       "source": {
         "source": "url",
         "url": "https://github.com/RevenueCat/rc-claude-code-plugin.git",
-        "sha": "af7cb77996aee4e7e3c109c5afec81f716139032"
+        "path": "revenuecat",
+        "sha": "407e4651ff74dbaf47c457948ab540e620403c2a"
       },
       "homepage": "https://www.revenuecat.com"
     },
@@ -1675,7 +1676,8 @@
       "source": {
         "source": "url",
         "url": "https://github.com/RevenueCat/rc-claude-code-plugin.git",
-        "sha": "af7cb77996aee4e7e3c109c5afec81f716139032"
+        "path": "revenuecat",
+        "sha": "407e4651ff74dbaf47c457948ab540e620403c2a"
       },
       "homepage": "https://www.revenuecat.com"
     },
@@ -2007,7 +2009,8 @@
       "source": {
         "source": "url",
         "url": "https://github.com/sumup/sumup-skills.git",
-        "sha": "0fd0a911ecaffd7187fe35e914d8ead6de584ffd"
+        "path": "providers/claude/plugin",
+        "sha": "a4b5a9789e10e27fb375b68279bb0916074b8dd4"
       },
       "homepage": "https://www.sumup.com/"
     },
@@ -2247,7 +2250,8 @@
       "source": {
         "source": "url",
         "url": "https://github.com/zilliztech/zilliz-plugin.git",
-        "sha": "17cf04e6a3c272320b707d429484e4c00b3bec0b"
+        "path": "plugins/zilliz",
+        "sha": "e960396da0bd0b1cb219fa97e3bcbb425ee1abbd"
       },
       "homepage": "https://docs.zilliz.com"
     },
