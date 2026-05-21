@@ -1,18 +1,23 @@
 # mcp-tunnels
 
 Connect Claude to an MCP server running inside your private network through an
-Anthropic **MCP tunnel** — no inbound ports, no public exposure, no IP
-allowlisting on your origin. Traffic flows over an outbound-only connection.
+Anthropic [**MCP tunnel**](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/overview)
+— no inbound ports, no public exposure, no IP allowlisting on your origin.
+Traffic flows over an outbound-only connection.
 
 > **Research preview.** MCP tunnels is provided "as-is" with no uptime or
 > support commitment and depends on a third-party transport provider
-> (Cloudflare). Review the security model before sending anything sensitive.
+> (Cloudflare). Review the
+> [security model](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/security)
+> before sending anything sensitive.
 
 ## Commands
 
 ### `/create-docker-mcp-tunnel [deployment-dir]`
 
-Drives the MCP tunnels **quickstart** end to end on your machine, using Docker
+Drives the MCP tunnels
+[**quickstart**](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/quickstart)
+end to end on your machine, using Docker
 Compose with manually supplied credentials (the shortest path for local
 testing). It walks you through the parts only you can do in the Claude Console
 and runs everything else for you:
@@ -103,8 +108,10 @@ public port.
 This plugin targets the **manual-credentials, single-host, local-testing**
 path. For a hardened single-host deployment (non-root, read-only rootfs,
 dropped capabilities), a Kubernetes deployment, or programmatic access via
-Workload Identity Federation, see the official MCP tunnels deployment guides
-(Deploy with Docker Compose / Deploy with Helm) in the Claude documentation.
+[Workload Identity Federation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation),
+see the official deployment guides:
+[Deploy with Docker Compose](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/deploy-compose) /
+[Deploy with Helm](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/deploy-helm).
 
 ## Author
 

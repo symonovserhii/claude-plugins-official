@@ -6,13 +6,16 @@ allowed-tools: [Bash, Read, Write, Edit, AskUserQuestion]
 
 # Create a Docker MCP tunnel
 
-Drive the **MCP tunnels quickstart** end to end: from zero to Claude calling a
-private MCP server through an Anthropic-operated tunnel, using Docker Compose
-with manually supplied credentials (the shortest path for local testing).
+Drive the
+[**MCP tunnels quickstart**](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/quickstart)
+end to end: from zero to Claude calling a private MCP server through an
+Anthropic-operated tunnel, using Docker Compose with manually supplied
+credentials (the shortest path for local testing).
 
 > MCP tunnels is in **research preview**. It is provided "as-is" with no uptime
 > or support commitment and depends on a third-party transport (Cloudflare).
-> Do not put production traffic through this without reading the security model.
+> Do not put production traffic through this without reading the
+> [security model](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/security).
 
 You are guiding the user through a mix of **local commands you run** and
 **Console actions only they can do** (creating the tunnel, uploading the CA).
@@ -56,7 +59,8 @@ that and tell the user; the compose file is v2-compatible.
 
 ## Step 1 — Create the tunnel (Console — user action)
 
-Tell the user to do this in the [Claude Console](https://console.anthropic.com):
+Tell the user to do this in the [Claude Console](https://console.anthropic.com)
+(see [Create a tunnel](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/console#create-a-tunnel)):
 
 1. Sidebar → **Manage → MCP tunnels** → **New tunnel**. Give it a name.
 2. Leave **Set up programmatic access** **off** — this quickstart uses manual
@@ -115,8 +119,9 @@ cd "$DIR" && set -a && . ./.env && set +a && echo "domain: $TUNNEL_DOMAIN"
 ## Step 4 — Generate the CA and server certificate
 
 The proxy terminates an inner TLS handshake using a certificate signed by a CA
-the user controls. Generate both (Linux/macOS shown; the docs also have a
-Windows PowerShell variant — offer it if the user is on Windows):
+the user controls. Generate both (Linux/macOS shown; the
+[quickstart](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/quickstart)
+also has a Windows PowerShell variant — offer it if the user is on Windows):
 
 ```bash
 cd "$DIR"
@@ -145,7 +150,8 @@ chmod 644 data/tls.key
 ```
 
 Why these flags: the explicit `-addext` extensions make the CA satisfy the
-tunnel's certificate requirements regardless of distro `openssl.cnf` defaults;
+tunnel's [certificate requirements](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/reference#certificate-requirements)
+regardless of distro `openssl.cnf` defaults;
 `-extfile` (not `-copy_extensions`, which is OpenSSL 3.0+ only) keeps this
 working on OpenSSL 1.1.x and adds the `AuthorityKeyIdentifier` the proxy
 requires. `chmod 644 data/tls.key` is **required**: openssl writes the key
@@ -157,7 +163,9 @@ which the `.gitignore` from Step 3 already excludes.
 ## Step 5 — Register the CA (Console — user action)
 
 Have the user, on the tunnel detail page, scroll to **Certificates** →
-**Add certificate**, and upload `$DIR/data/ca.crt` (or paste its contents —
+**Add certificate**
+(see [Add a CA certificate](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/console#add-a-ca-certificate)),
+and upload `$DIR/data/ca.crt` (or paste its contents —
 print it with `cat data/ca.crt` so they can copy it). The tunnel status flips
 to **Active** once a certificate is registered. The tunnel will not appear in
 the agent picker until this is done.
@@ -222,13 +230,12 @@ user's chosen subdomain → upstream if they brought their own server (e.g.
 
 ## Step 8 — Compose file
 
-Write `$DIR/docker-compose.yaml`. Images are pinned by digest (research-preview
-artifacts):
+Write `$DIR/docker-compose.yaml`. Images are pinned by digest:
 
 ```yaml
 services:
   mcp-gateway:
-    image: us-west1-docker.pkg.dev/proj-mcp-tunnel-poc/mcp-tunnel-poc-console/mcp-proxy@sha256:d00f95322d8f3c0521467f1969fdd89893cd495ffb7dae0c2d6250c7e47b3e26
+    image: us-docker.pkg.dev/anthropic-public-registry/images/mcp-proxy@sha256:6b9adedbf2763143ec72f106ecaf0ce7fd3294e89b208f54a1db97a33d14c5ba
     volumes:
       - ./config/mcp-gateway.yaml:/etc/mcp-gateway/config.yaml:ro
       - ./data:/data:ro
@@ -265,8 +272,9 @@ If the user brought their own server *and* it's containerized, add its service
 here too so it shares the Compose network with the proxy.
 
 (For a hardened single-host deployment — non-root user, read-only rootfs,
-`cap_drop: ALL`, `no-new-privileges` — point the user at the "Deploy with
-Docker Compose" doc; this quickstart keeps it minimal for fast local testing.)
+`cap_drop: ALL`, `no-new-privileges` — point the user at
+[Deploy with Docker Compose](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/deploy-compose);
+this quickstart keeps it minimal for fast local testing.)
 
 ## Step 9 — Start and verify
 
@@ -335,7 +343,9 @@ it the same as for any other MCP server.
 `docker compose logs cloudflared` (token/edge reachability) and
 `docker compose logs mcp-gateway` (config/cert/routing) are the two primary
 diagnostics. Check the outbound connection first, then the inner TLS handshake,
-then upstream routing.
+then upstream routing. See
+[Troubleshooting](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/troubleshooting)
+for additional cases.
 
 ## Operational notes (mention briefly, don't run unprompted)
 
@@ -352,5 +362,7 @@ then upstream routing.
 Summarize: deployment dir, route(s) configured, tunnel domain, and the exact
 URL Claude reaches the server at. Remind the user the token is a live secret in
 `$DIR/.env` (chmod 600, gitignored) and that this is a research-preview,
-local-testing setup — point them at the "Deploy with Docker Compose" / "Deploy
-with Helm" guides for a hardened or programmatic-access deployment.
+local-testing setup — point them at
+[Deploy with Docker Compose](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/deploy-compose) /
+[Deploy with Helm](https://platform.claude.com/docs/en/agents-and-tools/mcp-tunnels/deploy-helm)
+for a hardened or programmatic-access deployment.
