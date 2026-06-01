@@ -89,6 +89,67 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const bot = new Bot(TOKEN)
 let botUsername = ''
 
+// ============================================================================
+// Voice output (TTS) — calls Gemini TTS via gemini-code-bot container
+// ============================================================================
+const VOICE_PREFS_FILE = join(STATE_DIR, 'voice_prefs.json')
+type VoiceMode = 'auto' | 'on' | 'off'
+
+function loadVoicePrefs(): Record<string, VoiceMode> {
+  try {
+    return JSON.parse(readFileSync(VOICE_PREFS_FILE, 'utf8'))
+  } catch {
+    return {}
+  }
+}
+function saveVoicePrefs(prefs: Record<string, VoiceMode>) {
+  writeFileSync(VOICE_PREFS_FILE, JSON.stringify(prefs, null, 2))
+}
+function getVoiceMode(chat_id: string | number): VoiceMode {
+  const prefs = loadVoicePrefs()
+  return prefs[String(chat_id)] ?? 'auto'
+}
+function setVoiceMode(chat_id: string | number, mode: VoiceMode) {
+  const prefs = loadVoicePrefs()
+  prefs[String(chat_id)] = mode
+  saveVoicePrefs(prefs)
+}
+
+// Track if user's last inbound was voice (for auto mode).
+const lastInputWasVoice = new Map<string, boolean>()
+
+// Strip markdown — TTS reads asterisks/backticks literally.
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/[*_`~#]/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+}
+
+// Call gemini-code-bot Python TTS CLI, returns OGG Opus bytes or null on error.
+async function synthesizeVoice(text: string): Promise<Buffer | null> {
+  const clean = stripMarkdown(text).slice(0, 1500)
+  if (!clean.trim()) return null
+  try {
+    const { stdout } = await execFileAsync(
+      'docker',
+      ['exec', 'gemini-code-bot', 'python3', '-m', 'bot_core.tts_cli', clean],
+      { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024, timeout: 30000 },
+    )
+    return stdout as Buffer
+  } catch (e) {
+    process.stderr.write(`telegram channel: tts failed: ${(e as Error).message}\n`)
+    return null
+  }
+}
+
+function shouldRespondWithVoice(chat_id: string): boolean {
+  const mode = getVoiceMode(chat_id)
+  if (mode === 'on') return true
+  if (mode === 'off') return false
+  // auto: mirror input
+  return lastInputWasVoice.get(chat_id) ?? false
+}
+
 // Persistent typing indicator: Telegram clears the typing action after ~5s,
 // so re-ping every 4s while we're working. Cleared once the reply tool sends
 // a message, or after a 10-minute safety timeout.
@@ -1042,6 +1103,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        // Voice output: if user prefers voice and no files attached, synthesize
+        // and send as voice message instead of text chunks.
+        // Falls back to text if TTS fails. Long replies (already converted to
+        // file attachment above) skip voice — text > 12k is too long to speak.
+        if (files.length === 0 && text.length < 4000 && shouldRespondWithVoice(chat_id)) {
+          const audio = await synthesizeVoice(text)
+          if (audio && audio.length > 0) {
+            stopTyping(chat_id)
+            cancelWatchdog(chat_id)
+            const progress = progressMessages.get(chat_id)
+            if (progress) {
+              void bot.api.deleteMessage(chat_id, progress.message_id).catch(() => {})
+              clearProgress(chat_id)
+            }
+            const tmpOgg = join(tmpdir(), `tg-voice-${Date.now()}-${randomBytes(4).toString('hex')}.ogg`)
+            writeFileSync(tmpOgg, audio, { mode: 0o600 })
+            try {
+              const sent = await bot.api.sendVoice(chat_id, new InputFile(tmpOgg), {
+                ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
+              })
+              return { content: [{ type: 'text', text: JSON.stringify({ ok: true, message_ids: [sent.message_id], voice: true }) }] }
+            } finally {
+              try { rmSync(tmpOgg) } catch {}
+            }
+          }
+          // TTS failed — fall through to text path
+        }
+
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
@@ -1266,11 +1355,42 @@ bot.command('help', async ctx => {
   if (!gated) return
   const keyboard = buildQuickKeyboard(gated.access)
   await ctx.reply(
-    `Messages you send here route to a paired Claude Code session. ` +
-    `Text and photos are forwarded; replies and reactions come back.\n\n` +
+    `🤖 Claude Code Telegram Bot\n` +
+    `Это мост между Telegram и Claude Code (Sonnet 4.6) в tmux-сессии на homeserver. ` +
+    `Самый мощный из трёх ботов: реально пишет код, редактирует файлы, выполняет команды, использует MCP-серверы и skills.\n\n` +
+
+    `💬 Команды:\n` +
     `/start — pairing instructions\n` +
-    `/status — check your pairing state\n` +
-    `/kb — show the quick-action keyboard`,
+    `/status — статус подключения\n` +
+    `/kb — клавиатура быстрых команд\n` +
+    `/voice [auto|on|off] — режим ответа (голос/текст)\n` +
+    `/help — это сообщение\n\n` +
+
+    `🎙 Режимы /voice:\n` +
+    `• auto — голосом на голосовое, текстом на текст (по умолчанию)\n` +
+    `• on — всегда голосом\n` +
+    `• off — всегда текстом\n\n` +
+
+    `📥 Поддерживается:\n` +
+    `• Текст — отправляется в Claude напрямую\n` +
+    `• 🎤 Голосовые — транскрибируются Groq Whisper, потом в Claude\n` +
+    `• 📷 Фото — Claude видит их через vision\n` +
+    `• 📎 Файлы (документы, аудио, видео) — Claude читает\n` +
+    `• 🔘 Inline-кнопки (когда Claude их прикрепляет к ответу)\n\n` +
+
+    `🛠 Claude умеет (всё через CLI tools):\n` +
+    `• Bash — реально выполнить команды на сервере\n` +
+    `• Read/Edit/Write — работать с файлами\n` +
+    `• WebSearch — гуглить актуальные данные\n` +
+    `• WebFetch — читать страницы\n` +
+    `• MCP servers — handoff, playwright и др.\n` +
+    `• Skills — кастомные скрипты в ~/.claude/skills\n\n` +
+
+    `🤝 Соседние боты (если этот недоступен):\n` +
+    `• @GeminiCodeBot — Gemini 2.5 Flash, быстрый fallback\n` +
+    `• @ssymonov_gpt_bot — GPT-5.4-mini через Codex CLI, второй fallback\n\n` +
+
+    `💡 Tip: для длинных ответов (>12k символов) Claude приложит .md файл, а в чат пришлёт превью.`,
     keyboard ? { reply_markup: keyboard } : undefined,
   )
 })
@@ -1284,6 +1404,39 @@ bot.command('kb', async ctx => {
     return
   }
   await ctx.reply('Quick actions:', { reply_markup: keyboard })
+})
+
+bot.command('voice', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const chat_id = String(ctx.chat.id)
+  const arg = (ctx.match || '').trim().toLowerCase()
+
+  if (!arg) {
+    const current = getVoiceMode(chat_id)
+    await ctx.reply(
+      `Текущий режим: \`${current}\`\n\n` +
+      `Режимы:\n` +
+      `• \`auto\` — голосом на голосовое, текстом на текст (по умолчанию)\n` +
+      `• \`on\` — всегда голосом\n` +
+      `• \`off\` — всегда текстом\n\n` +
+      `Использование: /voice auto | /voice on | /voice off`
+    )
+    return
+  }
+
+  if (arg !== 'auto' && arg !== 'on' && arg !== 'off') {
+    await ctx.reply(`⚠️ Неизвестный режим \`${arg}\`. Используй auto, on или off.`)
+    return
+  }
+
+  setVoiceMode(chat_id, arg as VoiceMode)
+  const labels: Record<string, string> = {
+    auto: '🔁 Автоматически — отвечаю как ты',
+    on: '🔊 Всегда голосом',
+    off: '📝 Всегда текстом',
+  }
+  await ctx.reply(labels[arg])
 })
 
 bot.command('status', async ctx => {
@@ -1402,6 +1555,7 @@ bot.on('callback_query:data', async ctx => {
 })
 
 bot.on('message:text', async ctx => {
+  lastInputWasVoice.set(String(ctx.chat.id), false)
   await handleInbound(ctx, ctx.message.text, undefined)
 })
 
@@ -1454,6 +1608,7 @@ bot.on('message:document', async ctx => {
 })
 
 bot.on('message:voice', async ctx => {
+  lastInputWasVoice.set(String(ctx.chat.id), true)
   const voice = ctx.message.voice
   const access = loadAccess()
   let text = ctx.message.caption ?? '(voice message)'
