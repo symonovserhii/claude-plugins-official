@@ -89,473 +89,6 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const bot = new Bot(TOKEN)
 let botUsername = ''
 
-// ============================================================================
-// Voice output (TTS) — calls Gemini TTS via gemini-code-bot container
-// ============================================================================
-const VOICE_PREFS_FILE = join(STATE_DIR, 'voice_prefs.json')
-type VoiceMode = 'auto' | 'on' | 'off'
-
-function loadVoicePrefs(): Record<string, VoiceMode> {
-  try {
-    return JSON.parse(readFileSync(VOICE_PREFS_FILE, 'utf8'))
-  } catch {
-    return {}
-  }
-}
-function saveVoicePrefs(prefs: Record<string, VoiceMode>) {
-  writeFileSync(VOICE_PREFS_FILE, JSON.stringify(prefs, null, 2))
-}
-function getVoiceMode(chat_id: string | number): VoiceMode {
-  const prefs = loadVoicePrefs()
-  return prefs[String(chat_id)] ?? 'auto'
-}
-function setVoiceMode(chat_id: string | number, mode: VoiceMode) {
-  const prefs = loadVoicePrefs()
-  prefs[String(chat_id)] = mode
-  saveVoicePrefs(prefs)
-}
-
-// Track if user's last inbound was voice (for auto mode).
-const lastInputWasVoice = new Map<string, boolean>()
-
-// Strip markdown — TTS reads asterisks/backticks literally.
-function stripMarkdown(text: string): string {
-  return text
-    .replace(/[*_`~#]/g, '')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-}
-
-// Call gemini-code-bot Python TTS CLI, returns OGG Opus bytes or null on error.
-async function synthesizeVoice(text: string): Promise<Buffer | null> {
-  const clean = stripMarkdown(text).slice(0, 1500)
-  if (!clean.trim()) return null
-  try {
-    const { stdout } = await execFileAsync(
-      'docker',
-      ['exec', 'gemini-code-bot', 'python3', '-m', 'bot_core.tts_cli', clean],
-      { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024, timeout: 30000 },
-    )
-    return stdout as Buffer
-  } catch (e) {
-    process.stderr.write(`telegram channel: tts failed: ${(e as Error).message}\n`)
-    return null
-  }
-}
-
-function shouldRespondWithVoice(chat_id: string): boolean {
-  const mode = getVoiceMode(chat_id)
-  if (mode === 'on') return true
-  if (mode === 'off') return false
-  // auto: mirror input
-  return lastInputWasVoice.get(chat_id) ?? false
-}
-
-// Persistent typing indicator: Telegram clears the typing action after ~5s,
-// so re-ping every 4s while we're working. Cleared once the reply tool sends
-// a message, or after a 10-minute safety timeout.
-const typingTickers = new Map<string | number, { interval: ReturnType<typeof setInterval>; timeout: ReturnType<typeof setTimeout> }>()
-function startTyping(chat_id: string | number) {
-  stopTyping(chat_id)
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
-  const interval = setInterval(() => {
-    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
-  }, 4000)
-  const timeout = setTimeout(() => stopTyping(chat_id), 5 * 60 * 1000)
-  typingTickers.set(chat_id, { interval, timeout })
-}
-function stopTyping(chat_id: string | number) {
-  const t = typingTickers.get(chat_id)
-  if (t) {
-    clearInterval(t.interval)
-    clearTimeout(t.timeout)
-    typingTickers.delete(chat_id)
-  }
-}
-
-// Per-chat placeholder message that the plugin sends as soon as an inbound
-// arrives, so the user sees an immediate visual ack. The first chunk of the
-// next reply edits this placeholder in place (instead of sending a new
-// message), which gives an "agent is working" → "answer" feel rather than
-// "command sent → silence → answer". Cleared by reply or by 10-min timeout.
-const DEFAULT_PROGRESS_PLACEHOLDER = '⏳ Думаю...'
-const PROGRESS_SEND_TIMEOUT_MS = 3000
-const PROGRESS_TIMEOUT_MS = 10 * 60 * 1000
-const PROGRESS_TICK_MS = 6000
-// Best-effort tmux session name where Claude Code runs. Wrapper script
-// pins this to "claude". If tmux isn't available or the session is
-// renamed, status scraping silently falls back to the static placeholder.
-const CLAUDE_TMUX_SESSION = process.env.TELEGRAM_CLAUDE_TMUX_SESSION ?? 'claude'
-// Inbound watchdog. Set when we deliver a notification to Claude;
-// cancelled by any reply/edit_message/react in the same chat. If it
-// fires and tmux confirms Claude really is idle (no ✻/✽ thinking
-// glyphs), nudge the user that something dropped on the floor — most
-// often Claude finished tool use but forgot to call the reply tool.
-const WATCHDOG_TIMEOUT_MS = 5 * 60 * 1000
-const inboundWatchdogs = new Map<string, ReturnType<typeof setTimeout>>()
-function cancelWatchdog(chat_id: string) {
-  const t = inboundWatchdogs.get(chat_id)
-  if (t) {
-    clearTimeout(t)
-    inboundWatchdogs.delete(chat_id)
-  }
-}
-function armWatchdog(chat_id: string) {
-  cancelWatchdog(chat_id)
-  const timer = setTimeout(async () => {
-    inboundWatchdogs.delete(chat_id)
-    let stillThinking = false
-    try {
-      const { stdout } = await execFileAsync(
-        'tmux',
-        ['capture-pane', '-t', CLAUDE_TMUX_SESSION, '-p', '-S', '-10'],
-        { timeout: 1500 },
-      )
-      stillThinking = /[✻✽✺✶]\s+\w+/.test(stdout)
-    } catch {
-      // tmux unavailable — fall through to firing the warning rather than
-      // suppressing it, since we can't confirm Claude is busy.
-    }
-    if (stillThinking) {
-      // Genuinely working — give another window.
-      armWatchdog(chat_id)
-      return
-    }
-    void bot.api
-      .sendMessage(
-        chat_id,
-        '⚠️ За 5 минут от Claude не пришло ни одного ответа. Возможно, он завершил работу инструментами, но забыл вызвать reply. Попробуй повторить запрос или напиши «отправь результат предыдущей команды».',
-      )
-      .catch(() => {})
-  }, WATCHDOG_TIMEOUT_MS)
-  inboundWatchdogs.set(chat_id, timer)
-}
-
-async function readClaudeStatus(): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync(
-      'tmux',
-      ['capture-pane', '-t', CLAUDE_TMUX_SESSION, '-p', '-S', '-30'],
-      { timeout: 1500 },
-    )
-    const lines = stdout.split('\n')
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const clean = lines[i].replace(/\x1b\[[0-9;]*m/g, '').trim()
-      if (!clean) continue
-      let m: RegExpExecArray | null
-      m = /^●\s*Bash\(([^)]{1,80})/.exec(clean)
-      if (m) {
-        const cmd = m[1].replace(/[`"\\]/g, '').trim()
-        return `Bash: ${cmd.length > 50 ? cmd.slice(0, 50) + '…' : cmd}`
-      }
-      m = /^●\s*Skill\(([^)]+)\)/.exec(clean)
-      if (m) return `Скилл: /${m[1]}`
-      m = /^●\s*Read\(([^)]+)\)/.exec(clean)
-      if (m) return 'Читаю файл'
-      m = /^●\s*Edit\(/.exec(clean)
-      if (m) return 'Редактирую файл'
-      m = /^●\s*Write\(/.exec(clean)
-      if (m) return 'Пишу файл'
-      m = /^●\s*Grep\(/.exec(clean)
-      if (m) return 'Ищу в коде'
-      m = /^●\s*Glob\(/.exec(clean)
-      if (m) return 'Ищу файлы'
-      m = /^●\s*Web/.exec(clean)
-      if (m) return 'Гуглю'
-      m = /^●\s*Agent\(([^)]{1,60})/.exec(clean)
-      if (m) return `Подагент: ${m[1].trim()}`
-      m = /^●\s*Task\(/.exec(clean)
-      if (m) return 'Задача'
-      // The "*Actualizing/Worked/Crunched/Thinking" status lines from
-      // Claude's progress UI — generic "thinking" with sub-action.
-      if (/^[✻✽✺✶]\s+/.test(clean)) {
-        const sub = clean.replace(/^[✻✽✺✶]\s+/, '').replace(/\s*\(.*\)\s*$/, '').trim()
-        if (sub.toLowerCase().startsWith('worked')) return 'Думаю'
-        if (sub.toLowerCase().startsWith('crunched')) return 'Размышляю'
-        if (sub.toLowerCase().startsWith('actualizing')) return 'Подвожу итог'
-        return sub.split(/\s+/)[0] || 'Думаю'
-      }
-    }
-    return null
-  } catch {
-    return null
-  }
-}
-type ProgressEntry = {
-  message_id: number
-  baseText: string
-  startedAt: number
-  timeout: ReturnType<typeof setTimeout>
-  ticker: ReturnType<typeof setInterval>
-}
-const progressMessages = new Map<string | number, ProgressEntry>()
-function fmtElapsed(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  const rem = s % 60
-  return rem === 0 ? `${m}m` : `${m}m ${rem}s`
-}
-function clearProgress(chat_id: string | number) {
-  const e = progressMessages.get(chat_id)
-  if (e) {
-    clearInterval(e.ticker)
-    clearTimeout(e.timeout)
-    progressMessages.delete(chat_id)
-  }
-}
-function pickPlaceholder(setting: string | Record<string, string> | undefined, language_code?: string): string {
-  if (typeof setting === 'string') return setting
-  if (setting && typeof setting === 'object') {
-    if (language_code && setting[language_code]) return setting[language_code]
-    if (language_code) {
-      const base = language_code.split('-')[0]
-      if (setting[base]) return setting[base]
-    }
-    if (setting.default) return setting.default
-    const first = Object.values(setting)[0]
-    if (first) return first
-  }
-  return DEFAULT_PROGRESS_PLACEHOLDER
-}
-// Quick-keyboard helpers — turn access.quickKeyboard config into a
-// Telegram ReplyKeyboardMarkup, and translate a tapped label back to its
-// configured command so handleInbound can dispatch as if the user typed it.
-function buildQuickKeyboard(access: Access): { keyboard: { text: string }[][]; resize_keyboard: boolean; is_persistent: boolean } | undefined {
-  const rows = access.quickKeyboard?.rows
-  if (!rows || rows.length === 0) return undefined
-  return {
-    keyboard: rows.map(row => row.map(b => ({ text: b.label }))),
-    resize_keyboard: true,
-    is_persistent: true,
-  }
-}
-function quickKeyboardCommand(access: Access, text: string): string | null {
-  const rows = access.quickKeyboard?.rows
-  if (!rows) return null
-  for (const row of rows) {
-    for (const btn of row) {
-      if (btn.label === text) return btn.command
-    }
-  }
-  return null
-}
-
-// Daily digest scheduler. Polls every minute and synthesizes an MCP
-// inbound notification when the wall clock matches access.morningDigest.time.
-// Survives access.json edits because it re-reads on every tick. Bot
-// restart resets the dedupe stamp; possible double-fire only if restart
-// happens within the digest minute itself.
-let lastDigestStamp = ''
-function digestTick() {
-  const access = loadAccess()
-  const cfg = access.morningDigest
-  if (!cfg?.enabled || !cfg.time) return
-  const m = /^(\d{1,2}):(\d{2})$/.exec(cfg.time.trim())
-  if (!m) return
-  const targetH = String(parseInt(m[1], 10)).padStart(2, '0')
-  const targetM = m[2]
-  const now = new Date()
-  const curStamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
-  const targetStamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}-${targetH}:${targetM}`
-  if (curStamp !== targetStamp || lastDigestStamp === targetStamp) return
-  lastDigestStamp = targetStamp
-  const chat_id = cfg.chat_id ?? access.allowFrom[0]
-  if (!chat_id) return
-  const command = cfg.command ?? '/digest'
-  void mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: command,
-      meta: {
-        chat_id,
-        user: 'cron',
-        user_id: '0',
-        ts: now.toISOString(),
-        event: 'cron_trigger',
-      },
-    },
-  }).catch(() => {})
-  process.stderr.write(`telegram channel: morning digest fired at ${targetStamp} for chat ${chat_id}\n`)
-}
-setInterval(digestTick, 60_000).unref()
-
-// Discover user skills from ~/.claude/skills/<name>/SKILL.md and register
-// them as Telegram bot commands so they show up under the "/" menu in
-// chat. Telegram requires command names to match [a-z][a-z0-9_]{0,31};
-// skills with hyphens (e.g. ai-factory) are skipped — invoke those by
-// typing the slash manually. Description is taken from the YAML
-// frontmatter and truncated to 256 chars (Telegram's max).
-function loadSkillCommands(): { command: string; description: string }[] {
-  const skillsDir = join(homedir(), '.claude', 'skills')
-  let entries: string[] = []
-  try {
-    entries = readdirSync(skillsDir)
-  } catch {
-    return []
-  }
-  const out: { command: string; description: string }[] = []
-  for (const name of entries.sort()) {
-    if (!/^[a-z][a-z0-9_]{0,31}$/.test(name)) continue
-    let content: string
-    try {
-      content = readFileSync(join(skillsDir, name, 'SKILL.md'), 'utf8')
-    } catch {
-      continue
-    }
-    const fmMatch = /^---\s*\n([\s\S]*?)\n---/.exec(content)
-    if (!fmMatch) continue
-    const fm = fmMatch[1]
-    const dInline = /^description:\s*(.+)$/m.exec(fm)
-    let desc = dInline ? dInline[1].trim() : ''
-    if (desc === '|' || desc === '>' || desc === '|-' || desc === '>-') {
-      const dBlock = /^description:\s*[|>]-?\s*\n((?:  .*\n?)+)/m.exec(fm)
-      if (dBlock) desc = dBlock[1].split('\n').map(l => l.trim()).filter(Boolean).join(' ')
-    }
-    if ((desc.startsWith('"') && desc.endsWith('"')) || (desc.startsWith("'") && desc.endsWith("'"))) {
-      desc = desc.slice(1, -1)
-    }
-    if (desc.length > 256) desc = desc.slice(0, 253) + '...'
-    if (desc.length < 3) continue
-    out.push({ command: name, description: desc })
-  }
-  return out
-}
-
-// Multi-message debounce buffer. When access.bufferDelayMs > 0, plain-text
-// inbounds are queued and flushed as a single concatenated notification once
-// the user stops typing for that many milliseconds. Attachment-bearing
-// messages always flush any pending buffer first then go through unbuffered.
-type BufferedItem = { text: string; msgId?: number; ts: string }
-type ChatBuffer = {
-  items: BufferedItem[]
-  flushTimer: ReturnType<typeof setTimeout>
-  ctx: Context
-  from: NonNullable<Context['from']>
-}
-const inboundBuffers = new Map<string, ChatBuffer>()
-
-// Inline-extract text content from text-y documents the user sends as
-// attachments — code files, config, csv, json, markdown — so Claude
-// gets the body straight in the inbound notification instead of having
-// to call download_attachment first. Capped at DOC_INLINE_MAX_BYTES
-// to keep prompt size reasonable. Binary formats (pdf, docx, etc.) are
-// not handled here — Claude can still call download_attachment for them.
-const DOC_INLINE_MAX_BYTES = 256 * 1024
-const TEXT_DOC_EXTS = new Set([
-  '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonc', '.xml', '.yaml',
-  '.yml', '.toml', '.ini', '.conf', '.cfg', '.env', '.log', '.html', '.htm',
-  '.css', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.sh', '.bash', '.zsh',
-  '.py', '.rb', '.php', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.h',
-  '.cpp', '.hpp', '.cc', '.sql', '.diff', '.patch',
-])
-function isLikelyTextDoc(mime: string | undefined, name: string | undefined, size: number | undefined): boolean {
-  if (size != null && size > DOC_INLINE_MAX_BYTES) return false
-  if (mime) {
-    const m = mime.split(';')[0].trim().toLowerCase()
-    if (m.startsWith('text/')) return true
-    if (m === 'application/json' || m === 'application/xml' || m === 'application/yaml' || m === 'application/x-yaml' || m === 'application/javascript' || m === 'application/typescript' || m === 'application/x-sh') return true
-  }
-  if (name) {
-    const ext = extname(name).toLowerCase()
-    if (TEXT_DOC_EXTS.has(ext)) return true
-  }
-  return false
-}
-async function extractDocumentText(file_id: string): Promise<string | null> {
-  try {
-    const file = await bot.api.getFile(file_id)
-    if (!file.file_path) return null
-    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`)
-    if (!res.ok) return null
-    const buf = Buffer.from(await res.arrayBuffer())
-    if (buf.length > DOC_INLINE_MAX_BYTES) return null
-    // Reject likely-binary content (NUL bytes in first 4KB) — the file might
-    // have a misleading text-ish extension but actually be binary.
-    const sample = buf.subarray(0, 4096)
-    for (let i = 0; i < sample.length; i++) if (sample[i] === 0) return null
-    return buf.toString('utf8')
-  } catch {
-    return null
-  }
-}
-
-// Voice transcription via Groq Whisper. Off-default; opt-in through
-// access.voice.enabled. Bounded by a 30s timeout so a slow API can't wedge
-// the inbound flow — falls back to passing the raw attachment through.
-const GROQ_KEY = process.env.TELEGRAM_GROQ_KEY
-const GROQ_TRANSCRIBE_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
-const TRANSCRIBE_TIMEOUT_MS = 30000
-async function transcribeVoice(file_id: string, language?: string): Promise<string | null> {
-  if (!GROQ_KEY) return null
-  const ac = new AbortController()
-  const t = setTimeout(() => ac.abort(), TRANSCRIBE_TIMEOUT_MS)
-  try {
-    const file = await bot.api.getFile(file_id)
-    if (!file.file_path) return null
-    const dlRes = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`, { signal: ac.signal })
-    if (!dlRes.ok) return null
-    const buf = Buffer.from(await dlRes.arrayBuffer())
-    const fd = new FormData()
-    fd.append('file', new Blob([buf], { type: 'audio/ogg' }), 'audio.ogg')
-    fd.append('model', 'whisper-large-v3')
-    if (language && language !== 'auto') fd.append('language', language)
-    fd.append('response_format', 'text')
-    const res = await fetch(GROQ_TRANSCRIBE_URL, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${GROQ_KEY}` },
-      body: fd,
-      signal: ac.signal,
-    })
-    if (!res.ok) return null
-    const text = (await res.text()).trim()
-    return text || null
-  } catch {
-    return null
-  } finally {
-    clearTimeout(t)
-  }
-}
-
-async function startProgress(chat_id: string | number, language_code?: string): Promise<number | undefined> {
-  clearProgress(chat_id)
-  try {
-    const access = loadAccess()
-    const baseText = pickPlaceholder(access.progressPlaceholder, language_code)
-    // Race the API call against a hard timeout so a slow Telegram response
-    // never wedges the inbound flow. If the timeout wins, we fall through
-    // and Claude still receives the notification, just without a placeholder.
-    const sent = await Promise.race([
-      bot.api.sendMessage(chat_id, baseText),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('progress send timeout')), PROGRESS_SEND_TIMEOUT_MS)),
-    ])
-    const startedAt = Date.now()
-    const timeout = setTimeout(() => clearProgress(chat_id), PROGRESS_TIMEOUT_MS)
-    // Tick the placeholder with elapsed time so the user can see the bot is
-    // alive on long requests. Stops on reply (clearProgress) or safety
-    // timeout. Telegram returns 'message is not modified' if Claude already
-    // edit_message'd the placeholder to status text — we swallow that and
-    // let the user-supplied content win.
-    let lastShownText = baseText
-    const ticker = setInterval(async () => {
-      const elapsed = Date.now() - startedAt
-      const status = await readClaudeStatus()
-      const display = status
-        ? `⏳ ${status}… (${fmtElapsed(elapsed)})`
-        : `${baseText} (${fmtElapsed(elapsed)})`
-      // Telegram returns 400 'message is not modified' if the text is the
-      // same as last edit — skip the API call to keep the rate-limit
-      // budget for genuinely new content.
-      if (display === lastShownText) return
-      lastShownText = display
-      void bot.api.editMessageText(chat_id, sent.message_id, display).catch(() => {})
-    }, PROGRESS_TICK_MS)
-    progressMessages.set(chat_id, { message_id: sent.message_id, baseText, startedAt, timeout, ticker })
-    return sent.message_id
-  } catch {
-    return undefined
-  }
-}
-
 type PendingEntry = {
   senderId: string
   chatId: string
@@ -909,6 +442,488 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+// ============================================================================
+// Fork-only features grafted onto the upstream base below. Each block notes
+// which access.json key (if any) gates it and which upstream hook it plugs
+// into. Nothing here touches gate()/dmCommandGate()/PERMISSION_REPLY_RE — the
+// security-relevant paths above are untouched upstream code.
+// ============================================================================
+
+// ---- Voice output (TTS) -----------------------------------------------
+// Synthesizes a voice reply via a local `gemini-code-bot` Docker container's
+// TTS CLI. This is environment-specific (assumes that container exists on
+// the host) — ported as-is from the fork since it's opt-in per chat via
+// /voice and silently falls back to text if the container/exec fails.
+const VOICE_PREFS_FILE = join(STATE_DIR, 'voice_prefs.json')
+type VoiceMode = 'auto' | 'on' | 'off'
+
+function loadVoicePrefs(): Record<string, VoiceMode> {
+  try {
+    return JSON.parse(readFileSync(VOICE_PREFS_FILE, 'utf8'))
+  } catch {
+    return {}
+  }
+}
+function saveVoicePrefs(prefs: Record<string, VoiceMode>) {
+  writeFileSync(VOICE_PREFS_FILE, JSON.stringify(prefs, null, 2))
+}
+function getVoiceMode(chat_id: string | number): VoiceMode {
+  const prefs = loadVoicePrefs()
+  return prefs[String(chat_id)] ?? 'auto'
+}
+function setVoiceMode(chat_id: string | number, mode: VoiceMode) {
+  const prefs = loadVoicePrefs()
+  prefs[String(chat_id)] = mode
+  saveVoicePrefs(prefs)
+}
+
+// Track if user's last inbound was voice (for auto mode).
+const lastInputWasVoice = new Map<string, boolean>()
+
+// Strip markdown — TTS reads asterisks/backticks literally.
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/[*_`~#]/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+}
+
+// Call gemini-code-bot's Python TTS CLI, returns OGG Opus bytes or null on error.
+async function synthesizeVoice(text: string): Promise<Buffer | null> {
+  const clean = stripMarkdown(text).slice(0, 1500)
+  if (!clean.trim()) return null
+  try {
+    const { stdout } = await execFileAsync(
+      'docker',
+      ['exec', 'gemini-code-bot', 'python3', '-m', 'bot_core.tts_cli', clean],
+      { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024, timeout: 30000 },
+    )
+    return stdout as Buffer
+  } catch (e) {
+    process.stderr.write(`telegram channel: tts failed: ${(e as Error).message}\n`)
+    return null
+  }
+}
+
+function shouldRespondWithVoice(chat_id: string): boolean {
+  const mode = getVoiceMode(chat_id)
+  if (mode === 'on') return true
+  if (mode === 'off') return false
+  // auto: mirror input
+  return lastInputWasVoice.get(chat_id) ?? false
+}
+
+// ---- Persistent typing indicator ---------------------------------------
+// Telegram clears the typing action after ~5s, so re-ping every 4s while
+// we're working. Started at the top of handleInbound (replacing upstream's
+// single fire-and-forget sendChatAction ping), cleared once the reply tool
+// sends a message or edit_message fires, or after a 10-minute safety timeout.
+const typingTickers = new Map<string | number, { interval: ReturnType<typeof setInterval>; timeout: ReturnType<typeof setTimeout> }>()
+function startTyping(chat_id: string | number) {
+  stopTyping(chat_id)
+  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  const interval = setInterval(() => {
+    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  }, 4000)
+  const timeout = setTimeout(() => stopTyping(chat_id), 5 * 60 * 1000)
+  typingTickers.set(chat_id, { interval, timeout })
+}
+function stopTyping(chat_id: string | number) {
+  const t = typingTickers.get(chat_id)
+  if (t) {
+    clearInterval(t.interval)
+    clearTimeout(t.timeout)
+    typingTickers.delete(chat_id)
+  }
+}
+
+// ---- Progress placeholder + tmux status scraping + watchdog -----------
+// Per-chat placeholder message that the plugin sends as soon as an inbound
+// arrives, so the user sees an immediate visual ack. The first chunk of the
+// next reply edits this placeholder in place (instead of sending a new
+// message), which gives an "agent is working" → "answer" feel rather than
+// "command sent → silence → answer". Cleared by reply or by 10-min timeout.
+const DEFAULT_PROGRESS_PLACEHOLDER = '⏳ Thinking...'
+const PROGRESS_SEND_TIMEOUT_MS = 3000
+const PROGRESS_TIMEOUT_MS = 10 * 60 * 1000
+const PROGRESS_TICK_MS = 6000
+// Best-effort tmux session name where Claude Code runs. Wrapper script
+// pins this to "claude". If tmux isn't available or the session is
+// renamed, status scraping silently falls back to the static placeholder.
+const CLAUDE_TMUX_SESSION = process.env.TELEGRAM_CLAUDE_TMUX_SESSION ?? 'claude'
+// Inbound watchdog. Set when we deliver a notification to Claude;
+// cancelled by any reply/edit_message/react in the same chat. If it
+// fires and tmux confirms Claude really is idle (no ✻/✽ thinking
+// glyphs), nudge the user that something dropped on the floor — most
+// often Claude finished tool use but forgot to call the reply tool.
+const WATCHDOG_TIMEOUT_MS = 5 * 60 * 1000
+const inboundWatchdogs = new Map<string, ReturnType<typeof setTimeout>>()
+function cancelWatchdog(chat_id: string) {
+  const t = inboundWatchdogs.get(chat_id)
+  if (t) {
+    clearTimeout(t)
+    inboundWatchdogs.delete(chat_id)
+  }
+}
+function armWatchdog(chat_id: string) {
+  cancelWatchdog(chat_id)
+  const timer = setTimeout(async () => {
+    inboundWatchdogs.delete(chat_id)
+    let stillThinking = false
+    try {
+      const { stdout } = await execFileAsync(
+        'tmux',
+        ['capture-pane', '-t', CLAUDE_TMUX_SESSION, '-p', '-S', '-10'],
+        { timeout: 1500 },
+      )
+      stillThinking = /[✻✽✺✶]\s+\w+/.test(stdout)
+    } catch {
+      // tmux unavailable — fall through to firing the warning rather than
+      // suppressing it, since we can't confirm Claude is busy.
+    }
+    if (stillThinking) {
+      // Genuinely working — give another window.
+      armWatchdog(chat_id)
+      return
+    }
+    void bot.api
+      .sendMessage(
+        chat_id,
+        '⚠️ No reply from Claude in 5 minutes. It may have finished using tools but forgot to call reply. Try repeating the request or say "send the result of the previous command".',
+      )
+      .catch(() => {})
+  }, WATCHDOG_TIMEOUT_MS)
+  inboundWatchdogs.set(chat_id, timer)
+}
+
+async function readClaudeStatus(): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'tmux',
+      ['capture-pane', '-t', CLAUDE_TMUX_SESSION, '-p', '-S', '-30'],
+      { timeout: 1500 },
+    )
+    const lines = stdout.split('\n')
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const clean = lines[i].replace(/\x1b\[[0-9;]*m/g, '').trim()
+      if (!clean) continue
+      let m: RegExpExecArray | null
+      m = /^●\s*Bash\(([^)]{1,80})/.exec(clean)
+      if (m) {
+        const cmd = m[1].replace(/[`"\\]/g, '').trim()
+        return `Bash: ${cmd.length > 50 ? cmd.slice(0, 50) + '…' : cmd}`
+      }
+      m = /^●\s*Skill\(([^)]+)\)/.exec(clean)
+      if (m) return `Skill: /${m[1]}`
+      m = /^●\s*Read\(([^)]+)\)/.exec(clean)
+      if (m) return 'Reading a file'
+      m = /^●\s*Edit\(/.exec(clean)
+      if (m) return 'Editing a file'
+      m = /^●\s*Write\(/.exec(clean)
+      if (m) return 'Writing a file'
+      m = /^●\s*Grep\(/.exec(clean)
+      if (m) return 'Searching code'
+      m = /^●\s*Glob\(/.exec(clean)
+      if (m) return 'Searching files'
+      m = /^●\s*Web/.exec(clean)
+      if (m) return 'Searching the web'
+      m = /^●\s*Agent\(([^)]{1,60})/.exec(clean)
+      if (m) return `Subagent: ${m[1].trim()}`
+      m = /^●\s*Task\(/.exec(clean)
+      if (m) return 'Working on a task'
+      // The "*Actualizing/Worked/Crunched/Thinking" status lines from
+      // Claude's progress UI — generic "thinking" with sub-action.
+      if (/^[✻✽✺✶]\s+/.test(clean)) {
+        const sub = clean.replace(/^[✻✽✺✶]\s+/, '').replace(/\s*\(.*\)\s*$/, '').trim()
+        return sub.split(/\s+/)[0] || 'Thinking'
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+type ProgressEntry = {
+  message_id: number
+  baseText: string
+  startedAt: number
+  timeout: ReturnType<typeof setTimeout>
+  ticker: ReturnType<typeof setInterval>
+}
+const progressMessages = new Map<string | number, ProgressEntry>()
+function fmtElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  const rem = s % 60
+  return rem === 0 ? `${m}m` : `${m}m ${rem}s`
+}
+function clearProgress(chat_id: string | number) {
+  const e = progressMessages.get(chat_id)
+  if (e) {
+    clearInterval(e.ticker)
+    clearTimeout(e.timeout)
+    progressMessages.delete(chat_id)
+  }
+}
+function pickPlaceholder(setting: string | Record<string, string> | undefined, language_code?: string): string {
+  if (typeof setting === 'string') return setting
+  if (setting && typeof setting === 'object') {
+    if (language_code && setting[language_code]) return setting[language_code]
+    if (language_code) {
+      const base = language_code.split('-')[0]
+      if (setting[base]) return setting[base]
+    }
+    if (setting.default) return setting.default
+    const first = Object.values(setting)[0]
+    if (first) return first
+  }
+  return DEFAULT_PROGRESS_PLACEHOLDER
+}
+async function startProgress(chat_id: string | number, language_code?: string): Promise<number | undefined> {
+  clearProgress(chat_id)
+  try {
+    const access = loadAccess()
+    const baseText = pickPlaceholder(access.progressPlaceholder, language_code)
+    // Race the API call against a hard timeout so a slow Telegram response
+    // never wedges the inbound flow. If the timeout wins, we fall through
+    // and Claude still receives the notification, just without a placeholder.
+    const sent = await Promise.race([
+      bot.api.sendMessage(chat_id, baseText),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('progress send timeout')), PROGRESS_SEND_TIMEOUT_MS)),
+    ])
+    const startedAt = Date.now()
+    const timeout = setTimeout(() => clearProgress(chat_id), PROGRESS_TIMEOUT_MS)
+    // Tick the placeholder with elapsed time so the user can see the bot is
+    // alive on long requests. Stops on reply (clearProgress) or safety
+    // timeout. Telegram returns 'message is not modified' if Claude already
+    // edit_message'd the placeholder to status text — we swallow that and
+    // let the user-supplied content win.
+    let lastShownText = baseText
+    const ticker = setInterval(async () => {
+      const elapsed = Date.now() - startedAt
+      const status = await readClaudeStatus()
+      const display = status
+        ? `⏳ ${status}… (${fmtElapsed(elapsed)})`
+        : `${baseText} (${fmtElapsed(elapsed)})`
+      // Telegram returns 400 'message is not modified' if the text is the
+      // same as last edit — skip the API call to keep the rate-limit
+      // budget for genuinely new content.
+      if (display === lastShownText) return
+      lastShownText = display
+      void bot.api.editMessageText(chat_id, sent.message_id, display).catch(() => {})
+    }, PROGRESS_TICK_MS)
+    progressMessages.set(chat_id, { message_id: sent.message_id, baseText, startedAt, timeout, ticker })
+    return sent.message_id
+  } catch {
+    return undefined
+  }
+}
+
+// ---- Quick-keyboard helpers --------------------------------------------
+// Turn access.quickKeyboard config into a Telegram ReplyKeyboardMarkup, and
+// translate a tapped label back to its configured command so handleInbound
+// can dispatch as if the user typed it.
+function buildQuickKeyboard(access: Access): { keyboard: { text: string }[][]; resize_keyboard: boolean; is_persistent: boolean } | undefined {
+  const rows = access.quickKeyboard?.rows
+  if (!rows || rows.length === 0) return undefined
+  return {
+    keyboard: rows.map(row => row.map(b => ({ text: b.label }))),
+    resize_keyboard: true,
+    is_persistent: true,
+  }
+}
+function quickKeyboardCommand(access: Access, text: string): string | null {
+  const rows = access.quickKeyboard?.rows
+  if (!rows) return null
+  for (const row of rows) {
+    for (const btn of row) {
+      if (btn.label === text) return btn.command
+    }
+  }
+  return null
+}
+
+// ---- Morning digest cron ------------------------------------------------
+// Polls every minute and synthesizes an MCP inbound notification when the
+// wall clock matches access.morningDigest.time. Survives access.json edits
+// because it re-reads on every tick. Bot restart resets the dedupe stamp;
+// possible double-fire only if restart happens within the digest minute
+// itself.
+let lastDigestStamp = ''
+function digestTick() {
+  const access = loadAccess()
+  const cfg = access.morningDigest
+  if (!cfg?.enabled || !cfg.time) return
+  const m = /^(\d{1,2}):(\d{2})$/.exec(cfg.time.trim())
+  if (!m) return
+  const targetH = String(parseInt(m[1], 10)).padStart(2, '0')
+  const targetM = m[2]
+  const now = new Date()
+  const curStamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+  const targetStamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}-${targetH}:${targetM}`
+  if (curStamp !== targetStamp || lastDigestStamp === targetStamp) return
+  lastDigestStamp = targetStamp
+  const chat_id = cfg.chat_id ?? access.allowFrom[0]
+  if (!chat_id) return
+  const command = cfg.command ?? '/digest'
+  void mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: command,
+      meta: {
+        chat_id,
+        user: 'cron',
+        user_id: '0',
+        ts: now.toISOString(),
+        event: 'cron_trigger',
+      },
+    },
+  }).catch(() => {})
+  process.stderr.write(`telegram channel: morning digest fired at ${targetStamp} for chat ${chat_id}\n`)
+}
+setInterval(digestTick, 60_000).unref()
+
+// ---- Auto-register user skills as bot commands -------------------------
+// Discover user skills from ~/.claude/skills/<name>/SKILL.md and register
+// them as Telegram bot commands so they show up under the "/" menu in
+// chat. Telegram requires command names to match [a-z][a-z0-9_]{0,31};
+// skills with hyphens (e.g. ai-factory) are skipped — invoke those by
+// typing the slash manually. Description is taken from the YAML
+// frontmatter and truncated to 256 chars (Telegram's max).
+function loadSkillCommands(): { command: string; description: string }[] {
+  const skillsDir = join(homedir(), '.claude', 'skills')
+  let entries: string[] = []
+  try {
+    entries = readdirSync(skillsDir)
+  } catch {
+    return []
+  }
+  const out: { command: string; description: string }[] = []
+  for (const name of entries.sort()) {
+    if (!/^[a-z][a-z0-9_]{0,31}$/.test(name)) continue
+    let content: string
+    try {
+      content = readFileSync(join(skillsDir, name, 'SKILL.md'), 'utf8')
+    } catch {
+      continue
+    }
+    const fmMatch = /^---\s*\n([\s\S]*?)\n---/.exec(content)
+    if (!fmMatch) continue
+    const fm = fmMatch[1]
+    const dInline = /^description:\s*(.+)$/m.exec(fm)
+    let desc = dInline ? dInline[1].trim() : ''
+    if (desc === '|' || desc === '>' || desc === '|-' || desc === '>-') {
+      const dBlock = /^description:\s*[|>]-?\s*\n((?:  .*\n?)+)/m.exec(fm)
+      if (dBlock) desc = dBlock[1].split('\n').map(l => l.trim()).filter(Boolean).join(' ')
+    }
+    if ((desc.startsWith('"') && desc.endsWith('"')) || (desc.startsWith("'") && desc.endsWith("'"))) {
+      desc = desc.slice(1, -1)
+    }
+    if (desc.length > 256) desc = desc.slice(0, 253) + '...'
+    if (desc.length < 3) continue
+    out.push({ command: name, description: desc })
+  }
+  return out
+}
+
+// ---- Multi-message debounce buffer --------------------------------------
+// When access.bufferDelayMs > 0, plain-text inbounds are queued and flushed
+// as a single concatenated notification once the user stops typing for that
+// many milliseconds. Attachment-bearing messages always flush any pending
+// buffer first then go through unbuffered.
+type BufferedItem = { text: string; msgId?: number; ts: string }
+type ChatBuffer = {
+  items: BufferedItem[]
+  flushTimer: ReturnType<typeof setTimeout>
+  ctx: Context
+  from: NonNullable<Context['from']>
+}
+const inboundBuffers = new Map<string, ChatBuffer>()
+
+// ---- Inline-extract text from document attachments ----------------------
+// Text-y documents the user sends as attachments — code files, config, csv,
+// json, markdown — get their body pulled straight into the inbound
+// notification instead of making Claude call download_attachment first.
+// Capped at DOC_INLINE_MAX_BYTES to keep prompt size reasonable. Binary
+// formats (pdf, docx, etc.) are not handled here — Claude can still call
+// download_attachment for them.
+const DOC_INLINE_MAX_BYTES = 256 * 1024
+const TEXT_DOC_EXTS = new Set([
+  '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonc', '.xml', '.yaml',
+  '.yml', '.toml', '.ini', '.conf', '.cfg', '.env', '.log', '.html', '.htm',
+  '.css', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.sh', '.bash', '.zsh',
+  '.py', '.rb', '.php', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.h',
+  '.cpp', '.hpp', '.cc', '.sql', '.diff', '.patch',
+])
+function isLikelyTextDoc(mime: string | undefined, name: string | undefined, size: number | undefined): boolean {
+  if (size != null && size > DOC_INLINE_MAX_BYTES) return false
+  if (mime) {
+    const m = mime.split(';')[0].trim().toLowerCase()
+    if (m.startsWith('text/')) return true
+    if (m === 'application/json' || m === 'application/xml' || m === 'application/yaml' || m === 'application/x-yaml' || m === 'application/javascript' || m === 'application/typescript' || m === 'application/x-sh') return true
+  }
+  if (name) {
+    const ext = extname(name).toLowerCase()
+    if (TEXT_DOC_EXTS.has(ext)) return true
+  }
+  return false
+}
+async function extractDocumentText(file_id: string): Promise<string | null> {
+  try {
+    const file = await bot.api.getFile(file_id)
+    if (!file.file_path) return null
+    const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`)
+    if (!res.ok) return null
+    const buf = Buffer.from(await res.arrayBuffer())
+    if (buf.length > DOC_INLINE_MAX_BYTES) return null
+    // Reject likely-binary content (NUL bytes in first 4KB) — the file might
+    // have a misleading text-ish extension but actually be binary.
+    const sample = buf.subarray(0, 4096)
+    for (let i = 0; i < sample.length; i++) if (sample[i] === 0) return null
+    return buf.toString('utf8')
+  } catch {
+    return null
+  }
+}
+
+// ---- Voice transcription via Groq Whisper --------------------------------
+// Off-default; opt-in through access.voice.enabled. Bounded by a 30s timeout
+// so a slow API can't wedge the inbound flow — falls back to passing the raw
+// attachment through.
+const GROQ_KEY = process.env.TELEGRAM_GROQ_KEY
+const GROQ_TRANSCRIBE_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
+const TRANSCRIBE_TIMEOUT_MS = 30000
+async function transcribeVoice(file_id: string, language?: string): Promise<string | null> {
+  if (!GROQ_KEY) return null
+  const ac = new AbortController()
+  const t = setTimeout(() => ac.abort(), TRANSCRIBE_TIMEOUT_MS)
+  try {
+    const file = await bot.api.getFile(file_id)
+    if (!file.file_path) return null
+    const dlRes = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`, { signal: ac.signal })
+    if (!dlRes.ok) return null
+    const buf = Buffer.from(await dlRes.arrayBuffer())
+    const fd = new FormData()
+    fd.append('file', new Blob([buf], { type: 'audio/ogg' }), 'audio.ogg')
+    fd.append('model', 'whisper-large-v3')
+    if (language && language !== 'auto') fd.append('language', language)
+    fd.append('response_format', 'text')
+    const res = await fetch(GROQ_TRANSCRIBE_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${GROQ_KEY}` },
+      body: fd,
+      signal: ac.signal,
+    })
+    if (!res.ok) return null
+    const text = (await res.text()).trim()
+    return text || null
+  } catch {
+    return null
+  } finally {
+    clearTimeout(t)
+  }
+}
+
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
   {
@@ -1104,9 +1119,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         // Voice output: if user prefers voice and no files attached, synthesize
-        // and send as voice message instead of text chunks.
-        // Falls back to text if TTS fails. Long replies (already converted to
-        // file attachment above) skip voice — text > 12k is too long to speak.
+        // and send as voice message instead of text chunks. Falls back to text
+        // if TTS fails. Long replies (already converted to file attachment
+        // above) skip voice — text > 12k is too long to speak.
         if (files.length === 0 && text.length < 4000 && shouldRespondWithVoice(chat_id)) {
           const audio = await synthesizeVoice(text)
           if (audio && audio.length > 0) {
@@ -1123,7 +1138,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               const sent = await bot.api.sendVoice(chat_id, new InputFile(tmpOgg), {
                 ...(reply_to ? { reply_parameters: { message_id: reply_to } } : {}),
               })
-              return { content: [{ type: 'text', text: JSON.stringify({ ok: true, message_ids: [sent.message_id], voice: true }) }] }
+              return { content: [{ type: 'text', text: `sent (id: ${sent.message_id}, voice)` }] }
             } finally {
               try { rmSync(tmpOgg) } catch {}
             }
@@ -1261,8 +1276,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const editChatId = args.chat_id as string
         const editMsgId = Number(args.message_id)
         // Claude is actively producing output — stop the typing indicator
-        // and, if Claude is editing OUR progress placeholder, kill the
-        // elapsed-time ticker so it stops overwriting the new content.
+        // and cancel the unanswered-inbound watchdog. If Claude is editing
+        // OUR progress placeholder, also kill the elapsed-time ticker so it
+        // stops overwriting the new content.
         stopTyping(editChatId)
         cancelWatchdog(editChatId)
         const progress = progressMessages.get(editChatId)
@@ -1355,42 +1371,12 @@ bot.command('help', async ctx => {
   if (!gated) return
   const keyboard = buildQuickKeyboard(gated.access)
   await ctx.reply(
-    `🤖 Claude Code Telegram Bot\n` +
-    `Это мост между Telegram и Claude Code (Sonnet 4.6) в tmux-сессии на homeserver. ` +
-    `Самый мощный из трёх ботов: реально пишет код, редактирует файлы, выполняет команды, использует MCP-серверы и skills.\n\n` +
-
-    `💬 Команды:\n` +
+    `Messages you send here route to a paired Claude Code session. ` +
+    `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
-    `/status — статус подключения\n` +
-    `/kb — клавиатура быстрых команд\n` +
-    `/voice [auto|on|off] — режим ответа (голос/текст)\n` +
-    `/help — это сообщение\n\n` +
-
-    `🎙 Режимы /voice:\n` +
-    `• auto — голосом на голосовое, текстом на текст (по умолчанию)\n` +
-    `• on — всегда голосом\n` +
-    `• off — всегда текстом\n\n` +
-
-    `📥 Поддерживается:\n` +
-    `• Текст — отправляется в Claude напрямую\n` +
-    `• 🎤 Голосовые — транскрибируются Groq Whisper, потом в Claude\n` +
-    `• 📷 Фото — Claude видит их через vision\n` +
-    `• 📎 Файлы (документы, аудио, видео) — Claude читает\n` +
-    `• 🔘 Inline-кнопки (когда Claude их прикрепляет к ответу)\n\n` +
-
-    `🛠 Claude умеет (всё через CLI tools):\n` +
-    `• Bash — реально выполнить команды на сервере\n` +
-    `• Read/Edit/Write — работать с файлами\n` +
-    `• WebSearch — гуглить актуальные данные\n` +
-    `• WebFetch — читать страницы\n` +
-    `• MCP servers — handoff, playwright и др.\n` +
-    `• Skills — кастомные скрипты в ~/.claude/skills\n\n` +
-
-    `🤝 Соседние боты (если этот недоступен):\n` +
-    `• @GeminiCodeBot — Gemini 2.5 Flash, быстрый fallback\n` +
-    `• @ssymonov_gpt_bot — GPT-5.4-mini через Codex CLI, второй fallback\n\n` +
-
-    `💡 Tip: для длинных ответов (>12k символов) Claude приложит .md файл, а в чат пришлёт превью.`,
+    `/status — check your pairing state\n` +
+    `/kb — show the quick-action keyboard (if configured)\n` +
+    `/voice — control whether replies come back as voice messages`,
     keyboard ? { reply_markup: keyboard } : undefined,
   )
 })
@@ -1415,26 +1401,26 @@ bot.command('voice', async ctx => {
   if (!arg) {
     const current = getVoiceMode(chat_id)
     await ctx.reply(
-      `Текущий режим: \`${current}\`\n\n` +
-      `Режимы:\n` +
-      `• \`auto\` — голосом на голосовое, текстом на текст (по умолчанию)\n` +
-      `• \`on\` — всегда голосом\n` +
-      `• \`off\` — всегда текстом\n\n` +
-      `Использование: /voice auto | /voice on | /voice off`
+      `Current mode: ${current}\n\n` +
+      `Modes:\n` +
+      `• auto — voice reply to voice input, text reply to text input (default)\n` +
+      `• on — always reply with voice\n` +
+      `• off — always reply with text\n\n` +
+      `Usage: /voice auto | /voice on | /voice off`
     )
     return
   }
 
   if (arg !== 'auto' && arg !== 'on' && arg !== 'off') {
-    await ctx.reply(`⚠️ Неизвестный режим \`${arg}\`. Используй auto, on или off.`)
+    await ctx.reply(`Unknown mode "${arg}". Use auto, on, or off.`)
     return
   }
 
   setVoiceMode(chat_id, arg as VoiceMode)
   const labels: Record<string, string> = {
-    auto: '🔁 Автоматически — отвечаю как ты',
-    on: '🔊 Всегда голосом',
-    off: '📝 Всегда текстом',
+    auto: 'Auto — mirrors your input',
+    on: 'Always reply with voice',
+    off: 'Always reply with text',
   }
   await ctx.reply(labels[arg])
 })
@@ -1470,7 +1456,9 @@ bot.on('callback_query:data', async ctx => {
 
   // User button (set by Claude via reply.buttons). Forward as a regular
   // channel notification with meta.event=button_press so the model can
-  // react like to any other inbound.
+  // react like to any other inbound. Handled before the perm: regex below —
+  // these are a distinct namespace ('usr:' prefix) and never collide with
+  // the 5-letter permission-code alphabet.
   if (data.startsWith('usr:')) {
     const access = loadAccess()
     const senderId = String(ctx.from.id)
@@ -1590,6 +1578,10 @@ bot.on('message:document', async ctx => {
   const name = safeName(doc.file_name)
   const caption = ctx.message.caption ?? ''
   let text = caption || `(document: ${name ?? 'file'})`
+  // Inline-extract text-y attachments (code, config, csv, json, markdown)
+  // so Claude gets the body directly instead of needing download_attachment
+  // for the common case. Falls back to the caption-only text on failure —
+  // download_attachment is still available as a manual path.
   if (isLikelyTextDoc(doc.mime_type, name, doc.file_size)) {
     const extracted = await extractDocumentText(doc.file_id)
     if (extracted) {
@@ -1612,6 +1604,9 @@ bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
   const access = loadAccess()
   let text = ctx.message.caption ?? '(voice message)'
+  // Opt-in transcription via Groq Whisper — off by default (access.voice.enabled).
+  // Falls back to the raw '(voice message)' placeholder if disabled, unset,
+  // or the transcription call fails/times out.
   if (access.voice?.enabled) {
     const transcript = await transcribeVoice(voice.file_id, access.voice.language)
     if (transcript) text = `🎤 ${transcript}`
@@ -1706,40 +1701,18 @@ async function handleInbound(
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
 
-  // Quick-keyboard label → command rewrite. The user tapped one of the
-  // persistent reply-keyboard buttons; Telegram only ships the visible
-  // label as message text. Map it back to the configured command (e.g.
-  // "🌡 Температура" → "/temp") before any further processing so Claude
-  // sees the slash form, not the label.
-  const mappedCommand = quickKeyboardCommand(access, text)
-  if (mappedCommand) text = mappedCommand
-
-  // Enrich text with reply/forward context. Telegram delivers the original
-  // message body for replies and an origin descriptor for forwards; without
-  // this Claude only sees the new text and loses the thread.
-  const replyTo = ctx.message?.reply_to_message
-  if (replyTo) {
-    const orig = (replyTo as { text?: string; caption?: string }).text
-      ?? (replyTo as { text?: string; caption?: string }).caption
-      ?? '(non-text)'
-    const excerpt = orig.length > 240 ? orig.slice(0, 240) + '…' : orig
-    text = `[↩ replying to: "${excerpt}"]\n${text}`
-  }
-  const fwd = (ctx.message as { forward_origin?: { type: string; sender_user?: { username?: string; first_name?: string }; sender_chat?: { title?: string }; chat?: { title?: string }; sender_user_name?: string; date?: number } }).forward_origin
-  if (fwd) {
-    let source = 'unknown'
-    if (fwd.type === 'user' && fwd.sender_user) source = fwd.sender_user.username ? `@${fwd.sender_user.username}` : (fwd.sender_user.first_name ?? 'user')
-    else if (fwd.type === 'chat' && fwd.sender_chat) source = fwd.sender_chat.title ?? 'chat'
-    else if (fwd.type === 'channel' && fwd.chat) source = fwd.chat.title ?? 'channel'
-    else if (fwd.type === 'hidden_user' && fwd.sender_user_name) source = fwd.sender_user_name
-    const when = fwd.date ? new Date(fwd.date * 1000).toISOString() : ''
-    text = `[↪ forwarded from ${source}${when ? ` at ${when}` : ''}]\n${text}`
-  }
-
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
   // relaying as chat. The sender is already gate()-approved at this point
   // (non-allowlisted senders were dropped above), so we trust the reply.
+  //
+  // This MUST run on the raw, unmodified text before any of the rewriting
+  // below (quick-keyboard label→command mapping, reply/forward context
+  // prefixing) — those mutate `text` and would break PERMISSION_REPLY_RE's
+  // strict whole-string match (e.g. a reply-quoted "yes abcde" would get a
+  // "[↩ replying to: ...]" prefix prepended and silently fail to match,
+  // dropping the permission decision instead of relaying it). Keeping this
+  // check first and untouched preserves upstream's exact security behavior.
   const permMatch = PERMISSION_REPLY_RE.exec(text)
   if (permMatch) {
     void mcp.notification({
@@ -1758,7 +1731,39 @@ async function handleInbound(
     return
   }
 
-  // Typing indicator — re-pings every 4s until we reply or hit a 10-min safety timeout.
+  // Quick-keyboard label → command rewrite. The user tapped one of the
+  // persistent reply-keyboard buttons; Telegram only ships the visible
+  // label as message text. Map it back to the configured command (e.g.
+  // "Temperature" → "/temp") before any further processing so Claude
+  // sees the slash form, not the label.
+  const mappedCommand = quickKeyboardCommand(access, text)
+  if (mappedCommand) text = mappedCommand
+
+  // Enrich text with reply/forward context. Telegram delivers the original
+  // message body for replies and an origin descriptor for forwards; without
+  // this Claude only sees the new text and loses the thread.
+  const replyToMsg = ctx.message?.reply_to_message
+  if (replyToMsg) {
+    const orig = (replyToMsg as { text?: string; caption?: string }).text
+      ?? (replyToMsg as { text?: string; caption?: string }).caption
+      ?? '(non-text)'
+    const excerpt = orig.length > 240 ? orig.slice(0, 240) + '…' : orig
+    text = `[↩ replying to: "${excerpt}"]\n${text}`
+  }
+  const fwd = (ctx.message as { forward_origin?: { type: string; sender_user?: { username?: string; first_name?: string }; sender_chat?: { title?: string }; chat?: { title?: string }; sender_user_name?: string; date?: number } }).forward_origin
+  if (fwd) {
+    let source = 'unknown'
+    if (fwd.type === 'user' && fwd.sender_user) source = fwd.sender_user.username ? `@${fwd.sender_user.username}` : (fwd.sender_user.first_name ?? 'user')
+    else if (fwd.type === 'chat' && fwd.sender_chat) source = fwd.sender_chat.title ?? 'chat'
+    else if (fwd.type === 'channel' && fwd.chat) source = fwd.chat.title ?? 'channel'
+    else if (fwd.type === 'hidden_user' && fwd.sender_user_name) source = fwd.sender_user_name
+    const when = fwd.date ? new Date(fwd.date * 1000).toISOString() : ''
+    text = `[↪ forwarded from ${source}${when ? ` at ${when}` : ''}]\n${text}`
+  }
+
+  // Typing indicator — persistent, re-pings every 4s until we reply/edit or
+  // hit a 10-minute safety timeout (replaces upstream's single fire-and-forget
+  // ping, which Telegram would otherwise clear after ~5s on long-running turns).
   startTyping(chat_id)
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
@@ -1823,6 +1828,8 @@ async function flushInboundBuffer(chat_id: string): Promise<void> {
   })
 }
 
+// image_path goes in meta only — an in-content "[image attached — read: PATH]"
+// annotation is forgeable by any allowlisted sender typing that string.
 async function dispatchInbound(opts: {
   ctx: Context
   from: NonNullable<Context['from']>
@@ -1842,7 +1849,7 @@ async function dispatchInbound(opts: {
   const progressMessageId = await startProgress(opts.chat_id, opts.from.language_code)
   armWatchdog(opts.chat_id)
 
-  void mcp.notification({
+  mcp.notification({
     method: 'notifications/claude/channel',
     params: {
       content: opts.text,
@@ -1888,11 +1895,16 @@ void (async () => {
           attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          // Auto-register user skills (~/.claude/skills/<name>/SKILL.md) as
+          // bot commands alongside the built-ins, so they show up in
+          // Telegram's "/" menu without the user hand-maintaining a list.
           const skillCommands = loadSkillCommands()
           const allCommands = [
             { command: 'start', description: 'Welcome and setup guide' },
             { command: 'help', description: 'What this bot can do' },
             { command: 'status', description: 'Check your pairing status' },
+            { command: 'kb', description: 'Show the quick-action keyboard' },
+            { command: 'voice', description: 'Set voice reply mode (auto/on/off)' },
             ...skillCommands,
           ].slice(0, 100) // Telegram caps at 100 commands per scope
           void bot.api.setMyCommands(allCommands, { scope: { type: 'all_private_chats' } }).catch(() => {})
