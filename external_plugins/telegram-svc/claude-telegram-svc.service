@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Code Telegram Bot (Agent SDK service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/ssymonov/.bun/bin/bun /home/ssymonov/claude-plugins-fork/external_plugins/telegram-svc/index.ts
+Restart=on-failure
+RestartSec=10
+Environment=HOME=/home/ssymonov
+Environment=PATH=/home/ssymonov/.local/bin:/home/ssymonov/.bun/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/home/ssymonov/claude-plugins-fork/external_plugins/telegram-svc
+
+[Install]
+WantedBy=default.target
