@@ -17,6 +17,8 @@ import { createTelegramTools } from './tools.js'
 import { createPermissionRelay } from './permissions.js'
 import { startDigestCron } from './digest.js'
 import { runTurn, formatChannelPrompt, formatButtonPressPrompt, startSessionResetTimer, TurnTimeoutError } from './session.js'
+import { getProgressMessage, clearProgress } from './presence.js'
+import { chunk, MAX_CHUNK_LIMIT } from './util.js'
 
 installCrashGuards()
 claimSingleInstance()
@@ -53,11 +55,32 @@ async function processTurn(prompt: string, triggeringChatId: string | undefined)
     // Precise replacement for the old blind "5 minutes of silence" watchdog:
     // we know exactly whether reply/edit_message ever fired this turn.
     if (!result.hadReply && triggeringChatId) {
-      process.stderr.write('telegram-svc: turn completed without a reply/edit_message call\n')
-      await bot.api.sendMessage(
-        triggeringChatId,
-        '⚠️ No reply was sent for that message. It may have finished using tools but forgot to reply — try repeating the request.',
-      ).catch(() => {})
+      const finalText = result.resultText.trim()
+      if (finalText) {
+        // The model answered in transcript text but never called the reply
+        // tool (a poisoned resume session keeps repeating this) — deliver
+        // that text ourselves so the user always gets the answer.
+        process.stderr.write('telegram-svc: turn completed without reply — delivering result text as fallback\n')
+        const chunks = chunk(finalText, MAX_CHUNK_LIMIT, 'newline')
+        let start = 0
+        const progress = getProgressMessage(triggeringChatId)
+        if (progress) {
+          try {
+            await bot.api.editMessageText(triggeringChatId, progress.message_id, chunks[0])
+            start = 1
+          } catch { /* placeholder edit failed — fall through to plain sends */ }
+          clearProgress(triggeringChatId)
+        }
+        for (let i = start; i < chunks.length; i++) {
+          await bot.api.sendMessage(triggeringChatId, chunks[i]).catch(() => {})
+        }
+      } else {
+        process.stderr.write('telegram-svc: turn completed without a reply/edit_message call\n')
+        await bot.api.sendMessage(
+          triggeringChatId,
+          '⚠️ No reply was sent for that message. It may have finished using tools but forgot to reply — try repeating the request.',
+        ).catch(() => {})
+      }
     }
   } catch (err) {
     process.stderr.write(`telegram-svc: runTurn threw: ${err}\n`)
